@@ -4,7 +4,7 @@ import torch
 import torchvision.datasets
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
-from qwen_vl_utils import process_vision_info
+from qwen_vl_utilspip ipip import process_vision_info
 import json
 from transformers import AutoProcessor
 from PIL import Image
@@ -180,48 +180,38 @@ class MyDataset_QwenMath(Dataset):
         return len(self.data_js)
 
     def __getitem__(self, idx):
-        # Get data for this step
         item = self.data_js[idx]
         
-        problem_id = item['id']
-        step_id = item['sid']
+        # Get PRM800k format data
         prompt = item['input']
         add = item['add']
-        ground_truth = item['ground_truth']
-        accuracy = item['accuracy']  # Use accuracy as label
+        accuracy = item['score']  # Use score as label (0 or 1)
+        dataset = item.get('dataset', 'prm800k')
         
-        # Combine input and step content
-        full_text = prompt + "\n\n" + add
-        
-        # Process text only (no images)
+        # Format for PRM with step separator
         messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": full_text},
-                ],
-            }
+            {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": add + "<extra_0>"}
         ]
         
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=False
         )
         
-        # Process without images
         inputs = self.processor(
             text=[text],
             padding=True,
             return_tensors="pt",
+            truncation=True,
+            max_length=2048
         )
-        inputs = inputs.to("cuda")
 
         return {
             'input_ids': inputs['input_ids'].squeeze(),
             'attention_mask': inputs['attention_mask'].squeeze(),
-            'label': accuracy,  # Use accuracy as label
-            'problem_id': problem_id,
-            'step_id': step_id,
-            'ground_truth': ground_truth
+            'label': float(accuracy),
+            'dataset': dataset
         }
     
 
@@ -323,105 +313,74 @@ class MyMetaDataset_QwenMath(Dataset):
     def __init__(self, data_js, processor):
         self.data_js = data_js
         self.processor = processor
-        # Group data by problem ID
-        self.grouped_data = self._group_by_problem_id()
-        self.problem_ids = list(self.grouped_data.keys())
-
-    def _group_by_problem_id(self):
-        """Group steps by problem ID"""
-        grouped = {}
-        for item in self.data_js:
-            problem_id = item['id']
-            if problem_id not in grouped:
-                grouped[problem_id] = []
-            grouped[problem_id].append(item)
-        
-        # Sort steps by step_id within each problem
-        for problem_id in grouped:
-            grouped[problem_id].sort(key=lambda x: x['sid'])
-        
-        return grouped
 
     def __len__(self):
-        return len(self.problem_ids)
+        return len(self.data_js)
 
     def __getitem__(self, idx):
-        problem_id = self.problem_ids[idx]
-        steps_data = self.grouped_data[problem_id]
+        item = self.data_js[idx]
         
-        # Get problem info from first step
-        first_step = steps_data[0]
-        input_problem = first_step['input']
-        ground_truth = first_step['ground_truth']
+        # Assume AIME format with problem and multi-step solution
+        problem = item['input']
+        solution_steps = item.get('steps', [])  # List of solution steps
+        label = item['true_false']  # Final answer correctness
+        
+        r_dict = {}
         
         # Process each step
-        r_dict = {}
-        labels = []
-        
-        for step_data in steps_data:
-            step_id = step_data['sid']
-            step_text = step_data['add']
-            step_accuracy = step_data['accuracy']
-            
-            # Combine problem and step
-            full_text = input_problem + "\n\n" + step_text
-            
+        for step_idx, step_content in enumerate(solution_steps, 1):
             messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": full_text},
-                    ],
-                }
+                {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+                {"role": "user", "content": problem},
+                {"role": "assistant", "content": step_content + "<extra_0>"}
             ]
             
             text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=False
             )
             
             inputs = self.processor(
                 text=[text],
                 padding=True,
                 return_tensors="pt",
+                truncation=True,
+                max_length=2048
             )
-            inputs = inputs.to("cuda")
             
-            r_dict[f"{step_id}"] = {
+            r_dict[f"{step_idx}"] = {
                 'input_ids': inputs['input_ids'].squeeze(),
                 'attention_mask': inputs['attention_mask'].squeeze(),
             }
-            labels.append(step_accuracy)
         
-        # Convert labels to tensor
-        r_dict["labels"] = torch.tensor(labels, dtype=torch.float)
-        r_dict["problem_id"] = problem_id
-        r_dict["ground_truth"] = ground_truth
-        
+        r_dict["labels"] = torch.tensor(label, dtype=torch.float)
         return r_dict
     
 
 def build_dataloader(
-        processor_path,
-        train_json_file,
-        meta_json_file,
-        train_batch_size,
-        meta_batch_size,
-        dataset_type="qwen_math"  # "qwen_vl", "llava", "qwen_math"
+    processor_path,
+    train_json_file,
+    meta_json_file,
+    train_batch_size,
+    meta_batch_size,
+    dataset_type="qwen_math"
 ):
-    if dataset_type == "qwen_vl":
-        train_dataset = MyDataset_QwenVL(read_json(train_json_file), processor)
-        meta_dataset = MyMetaDataset_QwenVL(read_json(meta_json_file), processor)
-    elif dataset_type == "llava":
-        processor = AutoProcessor.from_pretrained(processor_path)
-        train_dataset = MyDataset_Llava(read_json(train_json_file), processor)
-        meta_dataset = MyMetaDataset_Llava(read_json(meta_json_file), processor)
-    elif dataset_type == "qwen_math":
-        processor = AutoProcessor.from_pretrained(processor_path)
-        train_dataset = MyDataset_QwenVL(read_json(train_json_file), processor)
-        meta_dataset = MyMetaDataset_QwenVL(read_json(meta_json_file), processor)
+    from transformers import AutoTokenizer
+    
+    if dataset_type == "qwen_math":
+        # Use tokenizer instead of processor for text-only
+        processor = AutoTokenizer.from_pretrained(processor_path, trust_remote_code=True)
+        train_dataset = MyDataset_QwenMath(read_json(train_json_file), processor)
+        meta_dataset = MyMetaDataset_QwenMath(read_json(meta_json_file), processor)
     else:
-        raise ValueError(f"Unknown dataset_type: {dataset_type}")
+        processor = AutoProcessor.from_pretrained(processor_path)
+        if dataset_type == "qwen_vl":
+            train_dataset = MyDataset_QwenVL(read_json(train_json_file), processor)
+            meta_dataset = MyMetaDataset_QwenVL(read_json(meta_json_file), processor)
+        elif dataset_type == "llava":
+            train_dataset = MyDataset_Llava(read_json(train_json_file), processor)
+            meta_dataset = MyMetaDataset_Llava(read_json(meta_json_file), processor)
+    
     train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
     meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
-
+    
     return train_dataloader, meta_dataloader
