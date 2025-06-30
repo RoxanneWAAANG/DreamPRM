@@ -3,7 +3,7 @@
 PYTHONPATH=/workspace/DreamPRM \
 python3 main.py \
   --train_json_file data/prm800k_train.json \
-  --meta_json_file  data/meta_aime.json \
+  --meta_json_file  None \
   --weights_path    outputs/qwen_math_prm \
   --batch_size      4 \
   --lr              1e-6 \
@@ -23,7 +23,8 @@ from betty.engine import Engine
 from betty.problems import ImplicitProblem
 from betty.configs import Config, EngineConfig
 import wandb
-from transformers import AdamW
+# from transformers import AdamW
+from torch.optim import AdamW
 import numpy as np
 
 
@@ -63,6 +64,11 @@ parser.add_argument("--paint_interval", type=int, default=20)
 parser.add_argument("--dataset_type", type=str, default="qwen_math")
 
 args = parser.parse_args()
+
+# Validate arguments
+if not args.baseline and args.meta_json_file is None:
+    raise ValueError("--meta_json_file is required when not using --baseline")
+
 print(args)
 set_seed(args.seed)
 domain_list = create_dataset_mapping(args.train_json_file)
@@ -78,7 +84,7 @@ resume_labels = None
 ) = build_dataloader(
     processor_path = args.reward_model,
     train_json_file = args.train_json_file,
-    meta_json_file = args.meta_json_file,
+    meta_json_file=args.meta_json_file if not args.baseline else None,
     train_batch_size= args.batch_size,
     meta_batch_size= args.batch_size,
     dataset_type=args.dataset_type
@@ -182,8 +188,10 @@ class Lower(ImplicitProblem):
         if len(lower_loss) == 100:
             mean_inner_loss = np.mean(lower_loss)
             mean_inner_weighted_loss = np.mean(lower_weighted_loss)
-            wandb.log({"inner_loss": mean_inner_loss,
-                       "inner_weighted_loss": mean_inner_weighted_loss, })
+            wandb.log({
+                "inner_loss": mean_inner_loss,
+                "inner_weighted_loss": mean_inner_weighted_loss, 
+            })
             lower_loss.clear()
             lower_weighted_loss.clear()
         # torch.cuda.empty_cache()
