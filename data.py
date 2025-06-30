@@ -4,7 +4,7 @@ import torch
 import torchvision.datasets
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
-from qwen_vl_utilspip ipip import process_vision_info
+from qwen_vl_utils import process_vision_info
 import json
 from transformers import AutoProcessor
 from PIL import Image
