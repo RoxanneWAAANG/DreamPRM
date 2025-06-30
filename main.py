@@ -2,8 +2,7 @@
 '''
 PYTHONPATH=/workspace/DreamPRM \
 python3 main.py \
-  --train_json_file data/prm800k_train.json \
-  --meta_json_file  None \
+  --train_json_file data/train_prm800k.json \
   --weights_path    outputs/qwen_math_prm \
   --batch_size      4 \
   --lr              1e-6 \
@@ -64,6 +63,10 @@ parser.add_argument("--paint_interval", type=int, default=20)
 parser.add_argument("--dataset_type", type=str, default="qwen_math")
 
 args = parser.parse_args()
+
+# Handle string "None" passed as argument
+if args.meta_json_file == "None":
+    args.meta_json_file = None
 
 # Validate arguments
 if not args.baseline and args.meta_json_file is None:
@@ -239,13 +242,15 @@ class ReweightingEngine(Engine):
         return {"loss": 1}
 
 
-upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
-lower_config = Config(type="darts", precision=args.precision, unroll_steps=args.unroll_steps,
-                    gradient_accumulation=args.gradiant_accumulation)
+# upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
+# lower_config = Config(type="darts", precision=args.precision, unroll_steps=args.unroll_steps,
+#                     gradient_accumulation=args.gradiant_accumulation)
+upper_config = Config(type="darts", retain_graph=True)
+lower_config = Config(type="darts", unroll_steps=args.unroll_steps) 
 engine_config = EngineConfig(
     train_iters=args.iteration_num,
-    valid_step=args.parser.save_every_iterations,
-    strategy=args.strategy,
+    valid_step=args.save_every_iterations,
+    # strategy=args.strategy,
     roll_back=args.rollback,
     logger_type="wandb",
 )
