@@ -364,23 +364,37 @@ def build_dataloader(
     meta_batch_size,
     dataset_type="qwen_math"
 ):
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoProcessor
     
     if dataset_type == "qwen_math":
         # Use tokenizer instead of processor for text-only
         processor = AutoTokenizer.from_pretrained(processor_path, trust_remote_code=True)
         train_dataset = MyDataset_QwenMath(read_json(train_json_file), processor)
-        meta_dataset = MyMetaDataset_QwenMath(read_json(meta_json_file), processor)
+        
+        # Only load meta dataset if meta_json_file is provided
+        if meta_json_file is not None:
+            meta_dataset = MyMetaDataset_QwenMath(read_json(meta_json_file), processor)
+            meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
+        else:
+            meta_dataloader = None
     else:
         processor = AutoProcessor.from_pretrained(processor_path)
         if dataset_type == "qwen_vl":
             train_dataset = MyDataset_QwenVL(read_json(train_json_file), processor)
-            meta_dataset = MyMetaDataset_QwenVL(read_json(meta_json_file), processor)
+            if meta_json_file is not None:
+                meta_dataset = MyMetaDataset_QwenVL(read_json(meta_json_file), processor)
+                meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
+            else:
+                meta_dataloader = None
         elif dataset_type == "llava":
             train_dataset = MyDataset_Llava(read_json(train_json_file), processor)
-            meta_dataset = MyMetaDataset_Llava(read_json(meta_json_file), processor)
+            if meta_json_file is not None:
+                meta_dataset = MyMetaDataset_Llava(read_json(meta_json_file), processor)
+                meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
+            else:
+                meta_dataloader = None
     
     train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
-    meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
+    # meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
     
     return train_dataloader, meta_dataloader
