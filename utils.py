@@ -16,6 +16,7 @@ def set_seed(seed=1):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def stop_epoch(time=3):
@@ -54,11 +55,10 @@ def load_QwenVL_RM(model_id = "reweighting/weights/base_model",
     return best_model
 
 
-def load_QwenMath_RM(model_id = "reweighting/weights/base_model",
-                        LN_id = "reweighting/weights/LN_weights.pt"):
+def load_QwenMath_RM(model_id = "reweighting/weights/qwen_math_prm"):
+    """Load QwenMath PRM model - no LN weights needed since PRM handles scoring internally"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     best_model = QwenMath_RM(torch.device('cuda' if torch.cuda.is_available() else 'cpu'), model_id)
-    best_model.LN.load_state_dict(torch.load(LN_id))
     best_model.to(device)
     return best_model
 
@@ -93,23 +93,26 @@ def generate_reward_model_input(input, response_step, image_path, processor):
 
 
 def generate_reward_model_input_math(input, response_step, processor):
-    """Generate input for math reward model (text-only, no image)"""
-    prompt = input + "\n\n" + response_step
+    """Generate input for math reward model (text-only, no image) with PRM format"""
+    # Add step separator for PRM
+    prompt = input + "\n\n" + response_step + "<extra_0>"
+    
     messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-            ],
-        }
+        {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+        {"role": "user", "content": input},
+        {"role": "assistant", "content": response_step + "<extra_0>"}
     ]
+    
     text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=False
     )
+    
     inputs = processor(
         text=[text],
         padding=True,
         return_tensors="pt",
+        truncation=True,
+        max_length=2048
     )
     inputs = inputs.to("cuda")
     return inputs
