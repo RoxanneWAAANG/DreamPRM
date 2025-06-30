@@ -69,32 +69,45 @@ class Llava_RM(nn.Module):
 
 
 class QwenMath_RM(nn.Module):
-    def __init__(self, device, model_path="Qwen/Qwen2.5-Math-7B-Instruct"):
+    def __init__(self, device, model_path="/workspace/weights/qwen2.5-math-prm-7b"):
         super(QwenMath_RM, self).__init__()
-        self.base_model = Qwen2ForCausalLM.from_pretrained(
+        self.base_model = AutoModel.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
             device_map=device,
-        )
-        # Linear layer mapping from vocabulary size to single scalar reward.
-        self.LN = nn.Linear(self.base_model.config.vocab_size, 1)
-        self.sigmoid = nn.Sigmoid()
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).eval()
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.step_sep_id = self.tokenizer.encode("<extra_0>")[0]
+
+    def make_step_rewards(self, logits, token_masks):
+        """Official Qwen implementation - exact copy"""
+        probabilities = F.softmax(logits, dim=-1)
+        probabilities = probabilities * token_masks.unsqueeze(-1)  # bs, seq_len, num_labels
+        all_scores_res = []
+        for i in range(probabilities.size(0)):
+            sample = probabilities[i]  # seq_len, num_labels
+            positive_probs = sample[sample != 0].view(-1, 2)[:, 1]  # valid_tokens, num_labels
+            non_zero_elements_list = positive_probs.cpu().tolist()
+            all_scores_res.append(non_zero_elements_list)
+        return all_scores_res
 
     def forward(self, input_ids, attention_mask):
-        # Passes text inputs through the base Qwen2 model to get logits.
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        # Passes text inputs through the base Qwen2 model to get logits.
-        # [:, -1, :]: Takes logits of the final token position.
-        outputs = outputs.logits[:, -1, :].to(dtype=torch.float)
-        # print(outputs)
-        # Maps logits to scalar reward using linear layer.
-        value_outputs = self.LN(outputs)
-        # Applies sigmoid to get probability in [0,1] range.
-        value_outputs = self.sigmoid(value_outputs)
-        # print(value_outputs)
-        # Removes dimension to return shape [batch_size] instead of [batch_size, 1].
-        return value_outputs.squeeze(dim=1)
+        outputs = self.base_model(input_ids=input_ids)
+        token_masks = (input_ids == self.step_sep_id)
+        step_rewards = self.make_step_rewards(outputs[0], token_masks)
+        
+        # Convert to tensor and average for DreamPRM compatibility
+        batch_scores = []
+        for scores in step_rewards:
+            if scores:
+                avg_score = torch.tensor(scores, device=input_ids.device).mean()
+            else:
+                avg_score = torch.tensor(0.5, device=input_ids.device)
+            batch_scores.append(avg_score)
+        
+        return torch.stack(batch_scores)
     
 
 class DomainTable(nn.Module):
