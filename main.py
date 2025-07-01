@@ -23,7 +23,7 @@ from betty.problems import ImplicitProblem
 from betty.configs import Config, EngineConfig
 import wandb
 # from transformers import AdamW
-from torch.optim import AdamW
+from torch.optim import AdamW, Adam
 import numpy as np
 
 
@@ -172,11 +172,14 @@ class Lower(ImplicitProblem):
         attention_mask = batch['attention_mask'].to(device)
         # pixel_values = batch['pixel_values'].to(device)
         # image_grid_thw = batch['image_grid_thw'].to(device)
-        labels = batch['label'].to(dtype=torch.float).to(device)
+        labels = batch['label'].to(dtype=torch.float32).to(device)
         domain_strings = batch['dataset']
+        labels = torch.clamp(labels, 0.0, 1.0)
 
         outputs = self.forward(input_ids=input_ids, attention_mask=attention_mask )
                                 #, pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+        outputs = outputs.to(dtype=torch.float32)
+
         if args.baseline or args.retrain:
             return criterion(outputs, labels)
 
@@ -206,14 +209,18 @@ class Lower(ImplicitProblem):
 
     def configure_module(self):
         # return QwenVL_RM(device)
-        return QwenMath_RM(device, args.reward_model)
+        return QwenMath_RM(device, args.reward_model).train()
 
     def configure_optimizer(self):
-        optimizer = AdamW(
-            self.module.parameters(),
-            lr=args.lr,
-        )
-        return optimizer
+        # optimizer = AdamW(
+        #     self.module.parameters(),
+        #     lr=args.lr,
+        # )
+        # return optimizer
+        return torch.optim.Adam(
+        self.module.parameters(),
+        lr=args.lr
+    )
 
     def configure_scheduler(self):
         scheduler = optim.lr_scheduler.StepLR(
@@ -230,17 +237,60 @@ class ReweightingEngine(Engine):
         #     self.inner.module.LN.state_dict(), f"{args.weights_path}/LN_weights.pt"
         # )
         # self.inner.module.base_model.save_pretrained(f"{args.weights_path}/base_model")
-        # Save the fine-tuned PRM model
-        self.inner.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
-        self.inner.module.tokenizer.save_pretrained(f"{args.weights_path}/qwen_math_prm")
 
-        # Save domain weights
-        torch.save(
-            self.outer.state_dict(),
-            f"{args.weights_path}/domain_weights.pt",
-        )
+        if args.baseline:
+            # Baseline mode: only fine-tune the lower problem.
+            lower_problem = self.problems[0]
+            # save the fine-tuned PRM model.
+            lower_problem.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
+            lower_problem.module.tokenizer.save_pretrained(f"{args.weights_path}/qwen_math_prm")
+        else:
+            # Non-baseline mode: save both upper and lower problems.
+            upper_problem = self.problems[0]
+            lower_problem = self.problems[1]
+            
+            # Save the fine-tuned PRM model.
+            lower_problem.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
+            lower_problem.module.tokenizer.save_pretrained(f"{args.weights_path}/qwen_math_prm")
+
+            # save the upper problem's state dict.
+            torch.save(
+                upper_problem.state_dict(),
+                f"{args.weights_path}/domain_weights.pt",
+            )
+            
         return {"loss": 1}
 
+# Updated load function for inference (add to utils.py)
+def load_QwenMath_RM(model_id="/workspace/weights/qwen2.5-math-prm-7b"):
+    """Load QwenMath PRM model - no separate LN weights needed"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    best_model = QwenMath_RM(torch.device('cuda' if torch.cuda.is_available() else 'cpu'), model_id)
+    best_model.to(device)
+    return best_model
+
+# Updated input generation function (add to utils.py)
+def generate_reward_model_input_math(input, response_step, processor):
+    """Generate input for math reward model with official PRM format"""
+    messages = [
+        {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+        {"role": "user", "content": input},
+        {"role": "assistant", "content": response_step + "<extra_0>"}  # Official format
+    ]
+    
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    
+    inputs = processor(
+        text=[text],
+        padding=True,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048
+    )
+    inputs = inputs.to("cuda")
+    return inputs
 
 # upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
 # lower_config = Config(type="darts", precision=args.precision, unroll_steps=args.unroll_steps,
