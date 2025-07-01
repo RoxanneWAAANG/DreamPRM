@@ -379,10 +379,6 @@ def main():
     print("1. prm800k_human_hard_labels.json - Original human binary labels")
     print("2. prm800k_qwen_soft_labels.json - Qwen continuous labels")  
     print("3. prm800k_dual_labels_mixed.json - Both labels for analysis")
-    print("\nNext steps:")
-    print("- Train separate models on hard vs soft labels")
-    print("- Compare performance on same validation set")
-    print("- Analyze which labeling method works better")
 
 if __name__ == "__main__":
     main()
