@@ -182,13 +182,15 @@ class MyDataset_QwenMath(Dataset):
     def __getitem__(self, idx):
         item = self.data_js[idx]
         
-        # Get PRM800k format data
+        # Get single-step data
         prompt = item['input']
         add = item['add']
-        accuracy = item['score']  # Use score as label (0 or 1)
+        accuracy = item['score']  # 0 or 1
         dataset = item.get('dataset', 'prm800k')
+
+        # print(f"Original accuracy value: {accuracy}, type: {type(accuracy)}")
         
-        # Format for PRM with step separator
+        # Format with <extra_0> separator (official PRM format)
         messages = [
             {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
             {"role": "user", "content": prompt},
@@ -210,7 +212,7 @@ class MyDataset_QwenMath(Dataset):
         return {
             'input_ids': inputs['input_ids'].squeeze(),
             'attention_mask': inputs['attention_mask'].squeeze(),
-            'label': float(accuracy),
+            'label': torch.tensor(float(accuracy), dtype=torch.float),
             'dataset': dataset
         }
     
