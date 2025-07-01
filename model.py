@@ -1,4 +1,5 @@
 from transformers import Qwen2VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, Qwen2ForCausalLM
+from transformers import AutoModel, AutoTokenizer, AutoModelForSequenceClassification
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 import torch
@@ -76,36 +77,46 @@ class QwenMath_RM(nn.Module):
             device_map=device,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-        ).eval()
+        )
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.step_sep_id = self.tokenizer.encode("<extra_0>")[0]
 
     def make_step_rewards(self, logits, token_masks):
-        """Official Qwen implementation - exact copy"""
-        probabilities = F.softmax(logits, dim=-1)
-        probabilities = probabilities * token_masks.unsqueeze(-1)  # bs, seq_len, num_labels
+        # a. Convert logits to probabilities.
+        probabilities = F.softmax(logits, dim=-1)   # [batch_size, seq_len, vocab_size]
+        # b. Mask to only consider <extra_0> positions.
+        probabilities = probabilities * token_masks.unsqueeze(-1) # bs, seq_len, num_labels
+        
         all_scores_res = []
         for i in range(probabilities.size(0)):
-            sample = probabilities[i]  # seq_len, num_labels
-            positive_probs = sample[sample != 0].view(-1, 2)[:, 1]  # valid_tokens, num_labels
-            non_zero_elements_list = positive_probs.cpu().tolist()
-            all_scores_res.append(non_zero_elements_list)
+            sample = probabilities[i] # [seq_len, vocab_size]
+            # d. Extract non-zero positions (where <extra_0> tokens are).
+            # Get "correct" class probability
+            positive_probs = sample[sample != 0].view(-1, 2)[:, 1] # valid_tokens, num_labels
+            # non_zero_elements_list = positive_probs.cpu().tolist()
+            # all_scores_res.append(non_zero_elements_list)
+            all_scores_res.append(positive_probs)
         return all_scores_res
-
+    
     def forward(self, input_ids, attention_mask):
-        outputs = self.base_model(input_ids=input_ids)
+        # a. Pass through PRM base model.
+        outputs = self.base_model(input_ids=input_ids)  # Shape: [batch_size, seq_len, vocab_size]
+        # b. Find step separator positions.
         token_masks = (input_ids == self.step_sep_id)
+        # c. Extract step-level scores using official PRM logic.
         step_rewards = self.make_step_rewards(outputs[0], token_masks)
         
-        # Convert to tensor and average for DreamPRM compatibility
+        # return step_rewards.
         batch_scores = []
         for scores in step_rewards:
-            if scores:
-                avg_score = torch.tensor(scores, device=input_ids.device).mean()
+            if len(scores) > 0:
+                # take the first score for each sample.
+                score = scores[0]
             else:
-                avg_score = torch.tensor(0.5, device=input_ids.device)
-            batch_scores.append(avg_score)
+                # if no scores, use a default value.
+                score = torch.tensor(0.5, device=input_ids.device, requires_grad=True)
+            batch_scores.append(score)
         
         return torch.stack(batch_scores)
     
