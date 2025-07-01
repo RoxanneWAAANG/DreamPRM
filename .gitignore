@@ -207,5 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 .venv/
-data/prm800k_train.json
+.venv310/
+data/train_prm800k.json
 qwen_vl_utils/__pycache__/
+outputs/
+wandb/
