@@ -1,7 +1,7 @@
 import json
 
 in_f  = "/workspace/data/dreamprm/prm800k/phase2_test.jsonl"
-out_f = "/workspace/DreamPRM/data/prm800k_train.json"
+out_f = "/workspace/DreamPRM/data/test_prm800k.json"
 
 records = []
 sample_id = 0

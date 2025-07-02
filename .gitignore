@@ -209,6 +209,9 @@ __marimo__/
 .venv/
 .venv310/
 data/train_prm800k.json
+data/test_prm800k.json
+data/meta_aime.json
+data/AIME_Dataset_1983_2024.csv
 qwen_vl_utils/__pycache__/
 outputs/
 wandb/

@@ -368,6 +368,28 @@ def build_dataloader(
 ):
     from transformers import AutoTokenizer, AutoProcessor
     
+    # 添加这个collate函数
+    def custom_collate_fn(batch):
+        from torch.nn.utils.rnn import pad_sequence
+        
+        # 提取各个字段
+        input_ids = [item['input_ids'] for item in batch]
+        attention_mask = [item['attention_mask'] for item in batch]
+        labels = [item['label'] for item in batch]
+        datasets = [item['dataset'] for item in batch]
+        
+        # 填充到相同长度
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        labels = torch.stack(labels)
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'label': labels,
+            'dataset': datasets
+        }
+    
     if dataset_type == "qwen_math":
         # Use tokenizer instead of processor for text-only
         processor = AutoTokenizer.from_pretrained(processor_path, trust_remote_code=True)
@@ -396,7 +418,7 @@ def build_dataloader(
             else:
                 meta_dataloader = None
     
-    train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, collate_fn=custom_collate_fn)
     # meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
     
     return train_dataloader, meta_dataloader

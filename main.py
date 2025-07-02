@@ -2,7 +2,7 @@
 '''
 PYTHONPATH=/workspace/DreamPRM \
 python3 main.py \
-  --train_json_file data/train_prm800k.json \
+  --train_json_file data/test_prm800k.json \
   --weights_path    outputs/qwen_math_prm \
   --batch_size      4 \
   --lr              1e-6 \
@@ -25,6 +25,7 @@ import wandb
 # from transformers import AdamW
 from torch.optim import AdamW, Adam
 import numpy as np
+import os
 
 
 parser = argparse.ArgumentParser(description="DreamPRM")
@@ -92,6 +93,7 @@ resume_labels = None
     meta_batch_size= args.batch_size,
     dataset_type=args.dataset_type
 )
+os.environ["WANDB_MODE"] = "offline"
 wandb.init(project="DreamPRM")
 
 device = torch.device(args.device)
