@@ -77,6 +77,8 @@ print(args)
 set_seed(args.seed)
 domain_list = create_dataset_mapping(args.train_json_file)
 print(domain_list)
+domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
+print("Domain to index mapping:", domain_to_idx)
 
 sampler = None
 resume_idxes = None
@@ -152,7 +154,9 @@ class Upper(ImplicitProblem):
         return meta_dataloader
 
     def configure_module(self):
-        meta_net = DomainTable(domain_list)
+        domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
+        meta_net = InstanceTable(domain_to_idx)
+        # meta_net = DomainTable(domain_list)
         return meta_net
 
     def configure_optimizer(self):
@@ -187,7 +191,8 @@ class Lower(ImplicitProblem):
 
         loss = criterion(outputs, labels)
         # weighted_loss = self.upper(domain_strings, loss)
-        weighted_loss = self.upper(domain_strings, loss.unsqueeze(0)).squeeze()
+        # weighted_loss = self.upper(domain_strings, loss.unsqueeze(0)).squeeze()
+        weighted_loss = self.upper([domain_strings], loss.unsqueeze(0)).squeeze()
         print(f"Domain: {domain_strings}, Loss: {loss.item()}, Weighted Loss: {weighted_loss.item()}")
 
         lower_loss.append(loss.item())

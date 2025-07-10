@@ -121,6 +121,45 @@ class QwenMath_RM(nn.Module):
         return torch.stack(batch_scores)
     
 
+class InstanceTable(nn.Module):
+    def __init__(self, domain_to_idx):
+        """
+        Args:
+            domain_to_idx (dict):
+                字符串 -> 整数索引 的映射，例如 {"domain_a": 0, "domain_b": 1}。
+        """
+        super(InstanceTable, self).__init__()
+        self.domain_to_idx = domain_to_idx
+        self.num_domains = len(domain_to_idx)
+
+        self.raw_weights = nn.Parameter(torch.zeros(self.num_domains))  # 初始为1
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, domain_strings, x):
+        """
+        Args:
+            domain_strings (list[str] or tuple[str]):
+                每个样本对应的 domain 名称，长度与 x 的 batch_size 相同。
+            x (torch.Tensor):
+                形状为 (batch_size, 1)，表示每个样本一个数值。
+
+        Returns:
+            torch.Tensor:
+                同形状 (batch_size, 1) 的张量，每个元素等于原输入乘以对应的 domain 权重。
+        """
+        positive_weights = self.raw_weights
+
+        idxes = [self.domain_to_idx[d] for d in domain_strings]
+        idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
+
+        domain_weights = positive_weights[idxes]
+
+        domain_weights = domain_weights.view(-1, 1)
+
+        out = x * domain_weights
+        return out
+
+
 class DomainTable(nn.Module):
     def __init__(self, domain_to_idx):
         """
