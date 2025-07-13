@@ -1,11 +1,11 @@
 # All code is original unless otherwise noted.
 '''
-PYTHONPATH=/workspace/DreamPRM \
+PYTHONPATH=/home/jack/Projects/yixin-llm/yixin-llm-data/MedicalGPT/DreamPRM \
 python3 main.py \
   --train_json_file data/train_prm800k.json \
   --weights_path    outputs/qwen_math_prm_v2 \
   --batch_size      8 \
-  --lr              5e-7 \
+  --lr              1e-7 \
   --iteration_num   174250 \
   --save_every_iterations 5000 \
   --scheduler_step_size 25000 \
@@ -18,6 +18,8 @@ python3 main.py \
 '''
 
 import argparse
+import torch
+import torch.nn as nn
 import torch.optim as optim
 from model import *
 from data import *
@@ -115,7 +117,8 @@ wandb.init(
 device = torch.device(args.device)
 if args.dataset_type == "qwen_math":
     # Use BCE for binary classification
-    criterion = nn.BCELoss()
+    # criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss(reduction="mean")
     criterion_meta = nn.BCELoss()
 else:
     # Use MSE for regression tasks
@@ -210,34 +213,97 @@ class Lower(ImplicitProblem):
         domain_strings = batch['dataset']
         labels = torch.clamp(labels, 0.0, 1.0)
 
-        outputs = self.forward(input_ids=input_ids, attention_mask=attention_mask )
+        outputs = self.forward(input_ids=input_ids, attention_mask=attention_mask)
                                 #, pixel_values=pixel_values, image_grid_thw=image_grid_thw)
         outputs = outputs.to(dtype=torch.float32)
 
-        if args.baseline or args.retrain:
-            return criterion(outputs, labels)
-
         loss = criterion(outputs, labels)
-        # weighted_loss = self.upper(domain_strings, loss)
-        # weighted_loss = self.upper(domain_strings, loss.unsqueeze(0)).squeeze()
-        weighted_loss = self.upper([domain_strings], loss.unsqueeze(0)).squeeze()
-        print(f"Domain: {domain_strings}, Loss: {loss.item()}, Weighted Loss: {weighted_loss.item()}")
 
-        lower_loss.append(loss.item())
-        lower_weighted_loss.append(weighted_loss.item())
+        if args.baseline:
+            # return criterion(outputs, labels)
+            lower_loss.append(loss.item())
 
-        if len(lower_loss) == 100:
-            mean_inner_loss = np.mean(lower_loss)
-            mean_inner_weighted_loss = np.mean(lower_weighted_loss)
-            wandb.log({
-                "inner_loss": mean_inner_loss,
-                "inner_weighted_loss": mean_inner_weighted_loss, 
-            })
-            lower_loss.clear()
-            lower_weighted_loss.clear()
-        # torch.cuda.empty_cache()
+            if len(lower_loss) == 25:
+                mean_loss = np.mean(lower_loss)
+                std_loss = np.std(lower_loss)
+                min_loss = min(lower_loss)
+                max_loss = max(lower_loss)
+                
+                # Track best loss
+                if mean_loss < best_loss:
+                    best_loss = mean_loss
+                
+                # Get current learning rate
+                if hasattr(self, 'scheduler'):
+                    current_lr = self.scheduler.get_last_lr()[0]
+                
+                wandb.log({
+                    "train_loss": mean_loss,
+                    "train_loss_std": std_loss,
+                    "train_loss_min": min_loss,
+                    "train_loss_max": max_loss,
+                    "best_loss": best_loss,
+                    "learning_rate": current_lr,
+                    "global_step": step_count,
+                    "epoch_approx": step_count * args.batch_size / len(domain_list) / 1000,
+                    "output_mean": outputs.mean().item(),
+                    "label_mean": labels.mean().item(),
+                })
+                
+                print(f"[Baseline Step {step_count}] Loss: {loss.item():.4f}, Output: {outputs.mean().item():.3f}, Label: {labels.mean().item():.3f}")
+                lower_loss.clear()
 
-        return weighted_loss
+            return loss
+
+        else:
+            # Convert single domain string to list for InstanceTable
+            if isinstance(domain_strings, str):
+                domain_strings_list = [domain_strings]
+            else:
+                domain_strings_list = domain_strings
+            
+            # Apply instance reweighting through Upper level
+            loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss
+            weighted_loss = self.upper(domain_strings_list, loss_tensor).squeeze()
+
+            if step_count % 50 == 0:
+                weights = self.upper.module.raw_weights.detach()
+                print(f"[Meta Step {step_count}] Domain: {domain_strings}, Loss: {loss.item():.4f}, Weighted: {weighted_loss.item():.4f}, Weights: {weights.cpu().numpy()}")
+            
+            lower_loss.append(loss.item())
+            lower_weighted_loss.append(weighted_loss.item())
+
+            if len(lower_loss) == 25:
+                mean_inner_loss = np.mean(lower_loss)
+                mean_inner_weighted_loss = np.mean(lower_weighted_loss)
+                
+                # Track best loss (using weighted loss)
+                if mean_inner_weighted_loss < best_loss:
+                    best_loss = mean_inner_weighted_loss
+                
+                # Get current learning rate
+                if hasattr(self, 'scheduler'):
+                    current_lr = self.scheduler.get_last_lr()[0]
+                
+                # Get current instance weights
+                instance_weights = self.upper.module.raw_weights.detach().cpu().numpy()
+                
+                wandb.log({
+                    "inner_loss": mean_inner_loss,
+                    "inner_weighted_loss": mean_inner_weighted_loss,
+                    "loss_difference": mean_inner_weighted_loss - mean_inner_loss,
+                    "best_weighted_loss": best_loss,
+                    "global_step": step_count,
+                    "learning_rate": current_lr,
+                    "instance_weights_raw": instance_weights.tolist(),
+                    "instance_weights_positive": (np.maximum(instance_weights, 0) + 1e-8).tolist(),
+                })
+                
+                print(f"[Meta Step {step_count}] Inner: {mean_inner_loss:.4f}, Weighted: {mean_inner_weighted_loss:.4f}, Diff: {mean_inner_weighted_loss - mean_inner_loss:.4f}")
+                lower_loss.clear()
+                lower_weighted_loss.clear()
+
+            return weighted_loss
 
     def configure_train_data_loader(self):
         return train_dataloader
