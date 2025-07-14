@@ -122,7 +122,7 @@ class QwenMath_RM(nn.Module):
     
 
 class InstanceTable(nn.Module):
-    def __init__(self, domain_to_idx):
+    def __init__(self, domain_to_idx, eps=1e-8):
         """
         Args:
             domain_to_idx (dict):
@@ -132,8 +132,11 @@ class InstanceTable(nn.Module):
         self.domain_to_idx = domain_to_idx
         self.num_domains = len(domain_to_idx)
 
-        self.raw_weights = nn.Parameter(torch.zeros(self.num_domains))  # 初始为1
-        self.relu = torch.nn.ReLU()
+        # start from balanced importance
+        init_val = 1.0
+        self.raw_weights = nn.Parameter(torch.ones(self.num_domains) * init_val)  # 初始为1
+        # self.relu = torch.nn.ReLU()
+        self.eps = eps
 
     def forward(self, domain_strings, x):
         """
@@ -147,14 +150,22 @@ class InstanceTable(nn.Module):
             torch.Tensor:
                 同形状 (batch_size, 1) 的张量，每个元素等于原输入乘以对应的 domain 权重。
         """
-        positive_weights = self.raw_weights
+        # positive_weights = self.raw_weights
+        w = torch.relu(self.raw_weights) + self.eps # (D,)
+        # normalize so sum(w)=D or sum(w)=1
+        w = w / w.sum() * self.num_domains  # (D,)
 
-        idxes = [self.domain_to_idx[d] for d in domain_strings]
-        idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
+        # map domains → weights
+        # idxes = [self.domain_to_idx[d] for d in domain_strings]
+        # idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
+        idxs = torch.tensor(
+            [self.domain_to_idx[d] for d in domain_strings],
+            device=x.device,
+            dtype=torch.long
+        )   # (B,)
 
-        domain_weights = positive_weights[idxes]
-
-        domain_weights = domain_weights.view(-1, 1)
+        domain_weights = w[idxs].unsqueeze(1)  # (B,1)
+        # domain_weights = domain_weights.view(-1, 1)
 
         out = x * domain_weights
         return out
