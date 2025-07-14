@@ -1,11 +1,12 @@
 # All code is original unless otherwise noted.
 '''
-PYTHONPATH=/home/jack/Projects/yixin-llm/yixin-llm-data/MedicalGPT/DreamPRM \
+PYTHONPATH=/workspace/DreamPRM \
 python3 main.py \
   --train_json_file data/train_prm800k.json \
   --weights_path    outputs/qwen_math_prm_v2 \
-  --batch_size      8 \
-  --lr              1e-7 \
+  --batch_size 2 \
+  --gradient_accumulation 16 \
+  --lr              1e-5 \
   --iteration_num   174250 \
   --save_every_iterations 5000 \
   --scheduler_step_size 25000 \
@@ -18,20 +19,22 @@ python3 main.py \
 '''
 
 import argparse
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from model import *
-from data import *
-from utils import *
+# from transformers import AdamW
+from torch.optim import AdamW
+import wandb
+
 from betty.engine import Engine
 from betty.problems import ImplicitProblem
 from betty.configs import Config, EngineConfig
-import wandb
-# from transformers import AdamW
-from torch.optim import AdamW, Adam
-import numpy as np
-import os
+
+from model import *
+from data import *
+from utils import *
 
 
 parser = argparse.ArgumentParser(description="DreamPRM")
@@ -41,22 +44,22 @@ parser.add_argument('--weights_path', type=str)
 parser.add_argument("--iteration_num", type=int, default=10000)
 parser.add_argument("--save_every_iterations", type=int, default=1000)
 parser.add_argument("--unroll_steps", type=int, default=5)
-parser.add_argument("--gradiant_accumulation", type=int, default=1)
+parser.add_argument("--gradient_accumulation", type=int, default=1)
 parser.add_argument("--device", type=str, default="cuda")
 parser.add_argument("--precision", type=str, default="bf16")
 parser.add_argument("--strategy", type=str, default="default")
 parser.add_argument("--rollback", action="store_true")
 parser.add_argument("--baseline", action="store_true")
-parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--local_rank", type=int, default=0)
 parser.add_argument("--lr", type=float, default=5e-7)
 parser.add_argument("--momentum", type=float, default=0.9)
 parser.add_argument("--scheduler_step_size", type=int, default=5000)
-parser.add_argument("--scheduler_gamma", type=float, default=0.8)
+parser.add_argument("--scheduler_gamma", type=float, default=0.5)
 parser.add_argument("--dampening", type=float, default=0.0)
 parser.add_argument("--nesterov", type=bool, default=False)
-parser.add_argument("--weight_decay", type=float, default=1e-4)
-parser.add_argument("--meta_lr", type=float, default=0.005)
+parser.add_argument("--weight_decay", type=float, default=1e-3)
+parser.add_argument("--meta_lr", type=float, default=0.01)
 parser.add_argument("--meta_weight_decay", type=float, default=0.0)
 parser.add_argument("--reward_model", type=str, default="Qwen/Qwen2-VL-2B-Instruct")
 parser.add_argument("--num_meta", type=int, default=1000)
@@ -70,24 +73,10 @@ parser.add_argument("--paint_interval", type=int, default=20)
 parser.add_argument("--dataset_type", type=str, default="qwen_math")
 
 args = parser.parse_args()
-
-# Handle string "None" passed as argument
-if args.meta_json_file == "None":
-    args.meta_json_file = None
-
-# Validate arguments
-if not args.baseline and args.meta_json_file is None:
-    raise ValueError("--meta_json_file is required when not using --baseline")
-
-print("Training Configuration:")
-print("="*50)
-for arg in vars(args):
-    print(f"{arg}: {getattr(args, arg)}")
-print("="*50)
-
 set_seed(args.seed)
+
+# Prepare data
 domain_list = create_dataset_mapping(args.train_json_file)
-print(domain_list)
 domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
 print("Domain to index mapping:", domain_to_idx)
 
@@ -101,20 +90,24 @@ resume_labels = None
 ) = build_dataloader(
     processor_path = args.reward_model,
     train_json_file = args.train_json_file,
-    meta_json_file=args.meta_json_file if not args.baseline else None,
+    meta_json_file=(None if args.baseline else args.meta_json_file),
     train_batch_size= args.batch_size,
     meta_batch_size= args.batch_size,
     dataset_type=args.dataset_type
 )
-os.environ["WANDB_MODE"] = "offline"
+
+# wandb init
+# os.environ["WANDB_MODE"] = "offline"
 wandb.init(
     project="DreamPRM-v0",
-    name=f"baseline-bs{args.batch_size}-lr{args.lr}-steps{args.iteration_num}",
-    config=vars(args),
-    tags=["baseline", "qwen-math", "prm-training"]
+    name=f"{'baseline' if args.baseline else 'meta'}-bs{args.batch_size}-lr{args.lr}",
+    config=vars(args)
 )
 
+# Device
 device = torch.device(args.device)
+
+# Loss
 if args.dataset_type == "qwen_math":
     # Use BCE for binary classification
     # criterion = nn.BCELoss()
@@ -125,6 +118,10 @@ else:
     criterion = nn.MSELoss()
     criterion_meta = nn.MSELoss()
 
+# Globals
+step_count = 0
+best_val_loss = float('inf')
+
 lower_weighted_loss = []
 lower_loss = []
 upper_loss = []
@@ -132,7 +129,9 @@ best_loss = float('inf')
 step_count = 0
 current_lr = args.lr
 
-
+# ---------------------------------
+# Upper Problem (Instance Reweighting)
+# ---------------------------------
 class Upper(ImplicitProblem):
     def forward(self, domain_strings, x):
         # torch.cuda.empty_cache()
@@ -140,169 +139,84 @@ class Upper(ImplicitProblem):
 
     def training_step(self, batch):
         # steps = [batch['1'], batch['2'], batch['3'], batch['4'], batch['5'],]
-        global step_count
-        numeric_keys = [k for k in batch.keys() if k.isdigit()]
-        sorted_keys = sorted(numeric_keys, key=lambda x: int(x))
-        steps = [batch[key] for key in sorted_keys]
         labels = batch['labels'].to(device)
+        loss_tensor = torch.zeros_like(labels)
+        domains = []
 
-        mean_score = 0
-        for i in steps:
+        for k in sorted([k for k in batch if k.isdigit()], key=lambda x: int(x)):
             # Text-only input for QwenMath
-            score = self.inner(
-                i['input_ids'].to(device),
-                i['attention_mask'].to(device),
-                # i['pixel_values'].to(device),
-                # i['image_grid_thw'].to(device)
+            out = self.inner(
+                batch[k]['input_ids'].to(device),
+                batch[k]['attention_mask'].to(device),
+                # batch[k]['pixel_values'].to(device),
+                # batch[k]['image_grid_thw'].to(device)
             )
-            mean_score += torch.log(score / (1 - score))
-            # mean_score += torch.log(score / (1 - score + 1e-8))
+            out = out.clamp(1e-8, 1-1e-8)
+            loss_tensor += torch.log(out / (1 - out))
+            domains.append(batch[k]['dataset'])
 
-        outputs = torch.sigmoid(mean_score / len(steps))
-        loss = criterion_meta(outputs, labels)
-        upper_loss.append(loss.item())
-        # print(f"Pred: {outputs.item():.3f}, Label: {labels.item():.3f}, Loss: {loss.item():.3f}")
-        if step_count % 50 == 0:  # Log every 50 steps
-            print(f"[Meta Step {step_count}] Pred: {outputs.item():.3f}, Label: {labels.item():.3f}, Loss: {loss.item():.3f}")
-
-        # torch.cuda.empty_cache()
-        if len(upper_loss) == 10:
-            mean_outer_loss = np.mean(upper_loss)
-            wandb.log({
-                "outer_loss": mean_outer_loss,
-                "meta_step": step_count,
-                "meta_pred_avg": outputs.item(),
-                "meta_label_avg": labels.item(),
-            })
-            upper_loss.clear()
-
-        return {"loss": loss}
+        weighted = torch.sigmoid(loss_tensor / len(domains))
+        loss = criterion(weighted, labels)
+        return {'loss': loss}
 
     def configure_train_data_loader(self):
         return meta_dataloader
 
     def configure_module(self):
-        domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
-        meta_net = InstanceTable(domain_to_idx)
-        # meta_net = DomainTable(domain_list)
-        return meta_net
+        return InstanceTable(domain_to_idx)
 
     def configure_optimizer(self):
-        meta_optimizer = AdamW(
+        return AdamW(
             self.module.parameters(),
-            lr=args.meta_lr,
-            weight_decay=args.weight_decay
+            lr=1e-2,
+            weight_decay=args.meta_weight_decay
         )
-        return meta_optimizer
 
-
+# ---------------------------------
+# Lower Problem (PRM Fine-tuning)
+# ---------------------------------
 class Lower(ImplicitProblem):
     def forward(self, input_ids, attention_mask):   #, pixel_values, image_grid_thw):
         # torch.cuda.empty_cache()
         return self.module(input_ids, attention_mask)  #, pixel_values, image_grid_thw)
 
     def training_step(self, batch):
-        global step_count, best_loss, current_lr
+        global step_count
         step_count += 1
 
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
+        # Inputs
+        ids    = batch['input_ids'].to(device)
+        mask   = batch['attention_mask'].to(device)
+        labels = batch['label'].float().to(device)
+        domains = batch.get('dataset', None)
         # pixel_values = batch['pixel_values'].to(device)
         # image_grid_thw = batch['image_grid_thw'].to(device)
-        labels = batch['label'].to(dtype=torch.float32).to(device)
-        domain_strings = batch['dataset']
-        labels = torch.clamp(labels, 0.0, 1.0)
 
-        outputs = self.forward(input_ids=input_ids, attention_mask=attention_mask)
-                                #, pixel_values=pixel_values, image_grid_thw=image_grid_thw)
-        outputs = outputs.to(dtype=torch.float32)
+        # Forward pass
+        logits = self.forward(ids, mask)
+        loss   = criterion(logits, labels)
 
-        loss = criterion(outputs, labels)
+        lr = self.scheduler.get_last_lr()[0] if hasattr(self, 'scheduler') else args.lr
 
         if args.baseline:
-            # return criterion(outputs, labels)
-            lower_loss.append(loss.item())
-
-            if len(lower_loss) == 25:
-                mean_loss = np.mean(lower_loss)
-                std_loss = np.std(lower_loss)
-                min_loss = min(lower_loss)
-                max_loss = max(lower_loss)
-                
-                # Track best loss
-                if mean_loss < best_loss:
-                    best_loss = mean_loss
-                
-                # Get current learning rate
-                if hasattr(self, 'scheduler'):
-                    current_lr = self.scheduler.get_last_lr()[0]
-                
-                wandb.log({
-                    "train_loss": mean_loss,
-                    "train_loss_std": std_loss,
-                    "train_loss_min": min_loss,
-                    "train_loss_max": max_loss,
-                    "best_loss": best_loss,
-                    "learning_rate": current_lr,
-                    "global_step": step_count,
-                    "epoch_approx": step_count * args.batch_size / len(domain_list) / 1000,
-                    "output_mean": outputs.mean().item(),
-                    "label_mean": labels.mean().item(),
-                })
-                
-                print(f"[Baseline Step {step_count}] Loss: {loss.item():.4f}, Output: {outputs.mean().item():.3f}, Label: {labels.mean().item():.3f}")
-                lower_loss.clear()
-
+            # Baseline: simple fine-tuning
+            wandb.log({'train/loss': loss.item(), 'train/lr': lr}, step=step_count)
+            if args.debug and step_count % 500 == 0:
+                print(f"Baseline Step {step_count}: loss={loss.item():.4f}, lr={lr:.2e}")
+            if hasattr(self, 'scheduler'):
+                self.scheduler.step()
             return loss
-
+        
         else:
-            # Convert single domain string to list for InstanceTable
-            if isinstance(domain_strings, str):
-                domain_strings_list = [domain_strings]
-            else:
-                domain_strings_list = domain_strings
-            
-            # Apply instance reweighting through Upper level
-            loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss
-            weighted_loss = self.upper(domain_strings_list, loss_tensor).squeeze()
-
-            if step_count % 50 == 0:
-                weights = self.upper.module.raw_weights.detach()
-                print(f"[Meta Step {step_count}] Domain: {domain_strings}, Loss: {loss.item():.4f}, Weighted: {weighted_loss.item():.4f}, Weights: {weights.cpu().numpy()}")
-            
-            lower_loss.append(loss.item())
-            lower_weighted_loss.append(weighted_loss.item())
-
-            if len(lower_loss) == 25:
-                mean_inner_loss = np.mean(lower_loss)
-                mean_inner_weighted_loss = np.mean(lower_weighted_loss)
-                
-                # Track best loss (using weighted loss)
-                if mean_inner_weighted_loss < best_loss:
-                    best_loss = mean_inner_weighted_loss
-                
-                # Get current learning rate
-                if hasattr(self, 'scheduler'):
-                    current_lr = self.scheduler.get_last_lr()[0]
-                
-                # Get current instance weights
-                instance_weights = self.upper.module.raw_weights.detach().cpu().numpy()
-                
-                wandb.log({
-                    "inner_loss": mean_inner_loss,
-                    "inner_weighted_loss": mean_inner_weighted_loss,
-                    "loss_difference": mean_inner_weighted_loss - mean_inner_loss,
-                    "best_weighted_loss": best_loss,
-                    "global_step": step_count,
-                    "learning_rate": current_lr,
-                    "instance_weights_raw": instance_weights.tolist(),
-                    "instance_weights_positive": (np.maximum(instance_weights, 0) + 1e-8).tolist(),
-                })
-                
-                print(f"[Meta Step {step_count}] Inner: {mean_inner_loss:.4f}, Weighted: {mean_inner_weighted_loss:.4f}, Diff: {mean_inner_weighted_loss - mean_inner_loss:.4f}")
-                lower_loss.clear()
-                lower_weighted_loss.clear()
-
+            # Meta-learning: instance reweighting
+            # Ensure losses tensor shape (batch_size, 1)
+            loss_tensor = loss.unsqueeze(1) if loss.dim()==1 else loss
+            weighted_loss = self.upper(domains, loss_tensor).squeeze()
+            wandb.log({'train/weighted_loss': weighted_loss.item(), 'train/lr': lr}, step=step_count)
+            if args.debug and step_count % 500 == 0:
+                print(f"Meta Step {step_count}: weighted_loss={weighted_loss.item():.4f}, lr={lr:.2e}")
+            if hasattr(self, 'scheduler'):
+                self.scheduler.step()
             return weighted_loss
 
     def configure_train_data_loader(self):
@@ -383,13 +297,17 @@ class ReweightingEngine(Engine):
             
         # return {"loss": 1}
         return {"loss": best_loss}
-
+    
 
 # upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
 # lower_config = Config(type="darts", precision=args.precision, unroll_steps=args.unroll_steps,
-#                     gradient_accumulation=args.gradiant_accumulation)
+#                     gradient_accumulation=args.gradient_accumulation)
 upper_config = Config(type="darts", retain_graph=True)
-lower_config = Config(type="darts", unroll_steps=args.unroll_steps) 
+lower_config = Config(
+    type='darts',
+    unroll_steps=args.unroll_steps,
+    gradient_accumulation=args.gradient_accumulation
+)
 engine_config = EngineConfig(
     train_iters=args.iteration_num,
     valid_step=args.save_every_iterations,
@@ -398,29 +316,22 @@ engine_config = EngineConfig(
     logger_type="wandb",
 )
 
-upper = Upper(name="upper", config=upper_config)
-lower = Lower(name="lower", config=lower_config)
+# Instantiate problems
+problems = [Lower(name='lower', config=lower_config)]
+dependencies = {}
 
-if args.baseline or args.retrain:
-    problems = [lower]
-    u2l, l2u = {}, {}
-    print("Running in BASELINE mode - single model training")
+if not args.baseline:
+    problems.insert(0, Upper(name='upper', config=upper_config))
+    dependencies = {problems[0]: [problems[1]]}
+    print("Running META-LEARNING mode")
 else:
-    problems = [upper, lower]
-    u2l = {upper: [lower]}
-    l2u = {lower: [upper]}
-    print("Running in META-LEARNING mode - bilevel optimization")
+    print("Running BASELINE mode")
 
-dependencies = {"l2u": l2u, "u2l": u2l}
-
-print(f"Starting training for {args.iteration_num:,} iterations...")
-print(f"Will save every {args.save_every_iterations} iterations")
-print(f"Estimated training time: {args.iteration_num * 0.5 / 60:.1f} minutes")
-
-engine = ReweightingEngine(
+# Run
+engine = Engine(
     config=engine_config,
     problems=problems,
-    dependencies=dependencies
+    dependencies={'l2u': {}, 'u2l': dependencies}
 )
 engine.run()
 
