@@ -1,5 +1,5 @@
 from transformers import Qwen2VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, Qwen2ForCausalLM
-from transformers import AutoModel, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoModelForTokenClassification, AutoTokenizer
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 import torch
@@ -71,16 +71,21 @@ class Llava_RM(nn.Module):
 
 class QwenMath_RM(nn.Module):
     def __init__(self, device, model_path="/workspace/weights/qwen2.5-math-prm-7b"):
-        super(QwenMath_RM, self).__init__()
-        self.base_model = AutoModel.from_pretrained(
+        super().__init__()
+        # Load a 2‐class token classification head
+        self.model = AutoModelForTokenClassification.from_pretrained(
             model_path,
+            num_labels=2,
             device_map=device,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         )
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.step_sep_id = self.tokenizer.encode("<extra_0>")[0]
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True
+        )
+        # ID of our step‐separator token
+        self.sep_id = self.tokenizer.convert_tokens_to_ids("<extra_0>")
 
     def make_step_rewards(self, logits, token_masks):
         # a. Convert logits to probabilities.
@@ -99,26 +104,38 @@ class QwenMath_RM(nn.Module):
             all_scores_res.append(positive_probs)
         return all_scores_res
     
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor):
+        """
+        Args:
+          input_ids:      [batch_size, seq_len]
+          attention_mask: [batch_size, seq_len]
+        Returns:
+          final_scores:   [batch_size]  (mean positive class probability over all steps)
+        """
         # a. Pass through PRM base model.
-        outputs = self.base_model(input_ids=input_ids)  # Shape: [batch_size, seq_len, vocab_size]
-        # b. Find step separator positions.
-        token_masks = (input_ids == self.step_sep_id)
-        # c. Extract step-level scores using official PRM logic.
-        step_rewards = self.make_step_rewards(outputs[0], token_masks)
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)  # Shape: [batch_size, seq_len, vocab_size]
+        logits = outputs.logits # [B, T, 2]
+        B, T, _ = logits.shape
+
+        # b. Find all positions where input_ids == sep_id
+        sep_mask = (input_ids == self.sep_id)   # [B, T]
+        # Gather the 2‐class logits at those sep positions:
+        sep_logits = logits[sep_mask]   # [N_steps, 2]
         
-        # return step_rewards.
-        batch_scores = []
-        for scores in step_rewards:
-            if len(scores) > 0:
-                # take the first score for each sample.
-                score = scores[0]
-            else:
-                # if no scores, use a default value.
-                score = torch.tensor(0.5, device=input_ids.device, requires_grad=True)
-            batch_scores.append(score)
-        
-        return torch.stack(batch_scores)
+        # c. Compute positive‐class probability at each step
+        sep_probs = F.softmax(sep_logits, dim=-1)[:, 1] # [N_steps]
+
+        # d. Reshape back into (B, K) where K may differ per batch
+        batch_counts = sep_mask.sum(dim=1).tolist() # list of length B
+        split_probs  = sep_probs.split(batch_counts)    # tuple of B tensors
+
+        # e. Aggregate across steps per example (mean)
+        final_scores = torch.stack([
+            probs.mean() if probs.numel()>0 else torch.tensor(0.5, device=input_ids.device)
+            for probs in split_probs
+        ], dim=0)   # [B]
+
+        return final_scores
     
 
 class InstanceTable(nn.Module):
