@@ -1,14 +1,11 @@
-import copy
-import numpy as np
-import torch
-import torchvision.datasets
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
-from qwen_vl_utils import process_vision_info
 import json
-from transformers import AutoProcessor
 from PIL import Image
 import re
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoTokenizer
+from qwen_vl_utils import process_vision_info
 
 
 def split_step(s_id, response):
@@ -172,48 +169,48 @@ class MyDataset_Llava(Dataset):
 
 
 class MyDataset_QwenMath(Dataset):
-    def __init__(self, data_js, processor):
-        self.data_js = data_js
-        self.processor = processor
+    """
+    Single-step PRM training examples for QwenMath.
+    Each sample provides one <extra_0> reasoning step.
+    """
+    def __init__(self, records, tokenizer):
+        self.records = records
+        self.tokenizer = tokenizer
 
     def __len__(self):
-        return len(self.data_js)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        item = self.data_js[idx]
-        
-        # Get single-step data
+        item = self.records[idx]
         prompt = item['input']
         add = item['add']
-        accuracy = item['score']  # 0 or 1
+        label = float(item.get('score', item.get('accuracy', 0)))
         dataset = item.get('dataset', 'prm800k')
 
-        # print(f"Original accuracy value: {accuracy}, type: {type(accuracy)}")
-        
-        # Format with <extra_0> separator (official PRM format)
+        # Build the PRM-formatted message
         messages = [
             {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-            {"role": "user", "content": prompt},
+            {"role": "user",   "content": prompt},
             {"role": "assistant", "content": add + "<extra_0>"}
         ]
         
-        text = self.processor.apply_chat_template(
+        text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
-        
-        inputs = self.processor(
+
+        inputs = self.tokenizer(
             text=[text],
             padding=True,
-            return_tensors="pt",
             truncation=True,
-            max_length=2048
+            max_length=2048,
+            return_tensors="pt"
         )
-
+        
         return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'label': torch.tensor(float(accuracy), dtype=torch.float),
-            'dataset': dataset
+            'input_ids':     inputs['input_ids'].squeeze(0),
+            'attention_mask':inputs['attention_mask'].squeeze(0),
+            'label':         torch.tensor(label, dtype=torch.float),
+            'dataset':       dataset
         }
     
 
@@ -312,51 +309,88 @@ class MyMetaDataset_Llava(Dataset):
 
 
 class MyMetaDataset_QwenMath(Dataset):
-    def __init__(self, data_js, processor):
-        self.data_js = data_js
-        self.processor = processor
+    """
+    Multi-step meta-learning examples. The `input` field contains all steps
+    joined by <extra_0>. We split and re-wrap each step individually.
+    """
+    def __init__(self, records, tokenizer):
+        self.records = records
+        self.tokenizer = tokenizer
+        self.sep_token = "<extra_0>"
 
     def __len__(self):
-        return len(self.data_js)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        item = self.data_js[idx]
-        
-        # Assume AIME format with problem and multi-step solution
-        problem = item['input']
-        solution_steps = item.get('steps', [])  # List of solution steps
-        label = item['true_false']  # Final answer correctness
-        
+        item = self.records[idx]
+        full_input = item['input']
+        label = float(item['true_false'])
+        dataset = item.get('dataset', 'aime')
+
+        # Split into steps by separator
+        raw_steps = full_input.split(self.sep_token)
+        steps = [s.strip() for s in raw_steps if s.strip()]
+
         r_dict = {}
-        
-        # Process each step
-        for step_idx, step_content in enumerate(solution_steps, 1):
+        for i, step in enumerate(steps, start=1):
+            # Wrap each step as a PRM message
             messages = [
                 {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-                {"role": "user", "content": problem},
-                {"role": "assistant", "content": step_content + "<extra_0>"}
+                {"role": "user",   "content": item.get('question', '')},
+                {"role": "assistant", "content": step + self.sep_token}
             ]
-            
-            text = self.processor.apply_chat_template(
+            text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False
             )
-            
-            inputs = self.processor(
+            inputs = self.tokenizer(
                 text=[text],
                 padding=True,
-                return_tensors="pt",
                 truncation=True,
-                max_length=2048
+                max_length=2048,
+                return_tensors="pt"
             )
-            
-            r_dict[f"{step_idx}"] = {
-                'input_ids': inputs['input_ids'].squeeze(),
-                'attention_mask': inputs['attention_mask'].squeeze(),
+            r_dict[str(i)] = {
+                'input_ids':      inputs['input_ids'].squeeze(0),
+                'attention_mask': inputs['attention_mask'].squeeze(0)
             }
-        
-        r_dict["labels"] = torch.tensor(label, dtype=torch.float)
+        r_dict['labels'] = torch.tensor(label, dtype=torch.float)
+        r_dict['dataset'] = dataset
         return r_dict
-    
+
+
+def custom_collate_fn(batch):
+    """
+    Collate for train: pad sequences, stack labels and datasets list.
+    """
+    input_ids = pad_sequence([b['input_ids'] for b in batch], batch_first=True, padding_value=0)
+    attention_mask = pad_sequence([b['attention_mask'] for b in batch], batch_first=True, padding_value=0)
+    labels = torch.stack([b['label'] for b in batch])
+    datasets = [b['dataset'] for b in batch]
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'label': labels,
+        'dataset': datasets
+    }
+
+
+def meta_collate_fn(batch):
+    """
+    Collate for meta: stack per-step input_ids/attention_masks, and labels.
+    """
+    labels = torch.stack([b['labels'] for b in batch])
+    datasets = [b['dataset'] for b in batch]
+    collated = {'labels': labels, 'dataset': datasets}
+
+    # find step keys (assume all samples have same number of steps)
+    step_keys = sorted([k for k in batch[0].keys() if k.isdigit()], key=lambda x: int(x))
+    for k in step_keys:
+        collated[k] = {
+            'input_ids':      torch.stack([b[k]['input_ids'] for b in batch]),
+            'attention_mask': torch.stack([b[k]['attention_mask'] for b in batch])
+        }
+    return collated
+
 
 def build_dataloader(
     processor_path,
@@ -366,59 +400,33 @@ def build_dataloader(
     meta_batch_size,
     dataset_type="qwen_math"
 ):
-    from transformers import AutoTokenizer, AutoProcessor
-    
-    # 添加这个collate函数
-    def custom_collate_fn(batch):
-        from torch.nn.utils.rnn import pad_sequence
-        
-        # 提取各个字段
-        input_ids = [item['input_ids'] for item in batch]
-        attention_mask = [item['attention_mask'] for item in batch]
-        labels = [item['label'] for item in batch]
-        datasets = [item['dataset'] for item in batch]
-        
-        # 填充到相同长度
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-        labels = torch.stack(labels)
-        
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'label': labels,
-            'dataset': datasets
-        }
-    
-    if dataset_type == "qwen_math":
-        # Use tokenizer instead of processor for text-only
-        processor = AutoTokenizer.from_pretrained(processor_path, trust_remote_code=True)
-        train_dataset = MyDataset_QwenMath(read_json(train_json_file), processor)
-        
-        # Only load meta dataset if meta_json_file is provided
-        if meta_json_file is not None:
-            meta_dataset = MyMetaDataset_QwenMath(read_json(meta_json_file), processor)
-            meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
-        else:
-            meta_dataloader = None
+    # Only for QwenMath
+    tokenizer = AutoTokenizer.from_pretrained(processor_path, trust_remote_code=True)
+    # Load train data
+    train_records = read_json(train_json_file)
+    train_dataset = MyDataset_QwenMath(train_records, tokenizer)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size,
+        shuffle=True,
+        collate_fn=custom_collate_fn
+    )
+
+    # Load meta data if provided
+    if meta_json_file:
+        meta_records = read_json(meta_json_file)
+        # ensure dataset tag
+        for rec in meta_records:
+            rec.setdefault('dataset', 'aime')
+        meta_dataset = MyMetaDataset_QwenMath(meta_records, tokenizer)
+        meta_loader = DataLoader(
+            meta_dataset,
+            batch_size=meta_batch_size,
+            shuffle=True,
+            collate_fn=meta_collate_fn
+        )
     else:
-        processor = AutoProcessor.from_pretrained(processor_path)
-        if dataset_type == "qwen_vl":
-            train_dataset = MyDataset_QwenVL(read_json(train_json_file), processor)
-            if meta_json_file is not None:
-                meta_dataset = MyMetaDataset_QwenVL(read_json(meta_json_file), processor)
-                meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
-            else:
-                meta_dataloader = None
-        elif dataset_type == "llava":
-            train_dataset = MyDataset_Llava(read_json(train_json_file), processor)
-            if meta_json_file is not None:
-                meta_dataset = MyMetaDataset_Llava(read_json(meta_json_file), processor)
-                meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
-            else:
-                meta_dataloader = None
-    
-    train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, collate_fn=custom_collate_fn)
-    # meta_dataloader = DataLoader(meta_dataset, batch_size=meta_batch_size, shuffle=True)
-    
-    return train_dataloader, meta_dataloader
+        meta_loader = None
+
+    return train_loader, meta_loader
+
