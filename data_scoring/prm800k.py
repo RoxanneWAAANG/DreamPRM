@@ -39,7 +39,7 @@ with open(in_f) as fin:
             accuracy = 1.0 if rating > 0 else 0.0
 
             records.append({
-                "id":           problem_id,         # unique sample ID
+                "id":           problem_id,        # unique sample ID
                 "sid":          sid,               # step number within problem
                 "input":        instr,             # full question prompt
                 "add":          step_text,         # this single CoT step
