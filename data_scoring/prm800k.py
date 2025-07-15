@@ -1,13 +1,14 @@
 import json
 
-in_f  = "/workspace/data/dreamprm/prm800k/phase2_test.jsonl"
-out_f = "/workspace/DreamPRM/data/test_prm800k.json"
+in_f  = "/Users/ruoxinwang/Desktop/Ph.D/Math_Reasoning/data/phase2_train.jsonl"
+out_f = "/Users/ruoxinwang/Desktop/Ph.D/Math_Reasoning/data/train.jsonl"
 
 records = []
-sample_id = 0
+problem_id = 0
 
 with open(in_f) as fin:
     for line in fin:
+        problem_id += 1
         ex = json.loads(line)
         instr = ex["question"]["problem"]
         # pull the official answer string
@@ -37,9 +38,8 @@ with open(in_f) as fin:
             # binarize accuracy
             accuracy = 1.0 if rating > 0 else 0.0
 
-            sample_id += 1
             records.append({
-                "id":           sample_id,         # unique sample ID
+                "id":           problem_id,         # unique sample ID
                 "sid":          sid,               # step number within problem
                 "input":        instr,             # full question prompt
                 "add":          step_text,         # this single CoT step
