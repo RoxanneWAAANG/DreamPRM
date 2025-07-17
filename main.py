@@ -3,14 +3,14 @@
 PYTHONPATH=/workspace/DreamPRM \
 python3 main.py \
   --train_json_file data/train_prm800k.json \
-  --weights_path    outputs/qwen_math_prm_v2 \
-  --batch_size 2 \
+  --weights_path outputs/qwen_math_prm_v1 \
+  --batch_size 1 \
   --gradient_accumulation 16 \
   --lr              1e-5 \
-  --iteration_num   174250 \
-  --save_every_iterations 5000 \
-  --scheduler_step_size 25000 \
-  --scheduler_gamma 0.8 \
+  --iteration_num   20000 \
+  --save_every_iterations 1000 \
+  --scheduler_step_size 2000 \
+  --scheduler_gamma 0.9 \
   --weight_decay    1e-4 \
   --dataset_type    qwen_math \
   --reward_model    Qwen/Qwen2.5-Math-PRM-7B \
@@ -78,7 +78,7 @@ set_seed(args.seed)
 # Prepare data
 domain_list = create_dataset_mapping(args.train_json_file)
 domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
-print("Domain to index mapping:", domain_to_idx)
+# print("Domain to index mapping:", domain_to_idx)
 
 sampler = None
 resume_idxes = None
@@ -201,7 +201,7 @@ class Lower(ImplicitProblem):
         if args.baseline:
             # Baseline: simple fine-tuning
             wandb.log({'train/loss': loss.item(), 'train/lr': lr}, step=step_count)
-            if args.debug and step_count % 500 == 0:
+            if step_count % 500 == 0:
                 print(f"Baseline Step {step_count}: loss={loss.item():.4f}, lr={lr:.2e}")
             if hasattr(self, 'scheduler'):
                 self.scheduler.step()
@@ -213,7 +213,7 @@ class Lower(ImplicitProblem):
             loss_tensor = loss.unsqueeze(1) if loss.dim()==1 else loss
             weighted_loss = self.upper(domains, loss_tensor).squeeze()
             wandb.log({'train/weighted_loss': weighted_loss.item(), 'train/lr': lr}, step=step_count)
-            if args.debug and step_count % 500 == 0:
+            if step_count % 500 == 0:
                 print(f"Meta Step {step_count}: weighted_loss={weighted_loss.item():.4f}, lr={lr:.2e}")
             if hasattr(self, 'scheduler'):
                 self.scheduler.step()
