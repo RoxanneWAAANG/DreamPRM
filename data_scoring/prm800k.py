@@ -2,73 +2,85 @@ import json
 from random import shuffle
 from tqdm import tqdm
 
-num_samples = 1000
-in_f  = "/Users/ruoxinwang/Desktop/Ph.D/Math_Reasoning/data/prm800k/phase2_train.jsonl"
-out_f = "/Users/ruoxinwang/Desktop/Ph.D/Math_Reasoning/DreamPRM/data/train_prm800k.json"
+num_samples = 10000
+in_f  = "/workspace/run1/data/prm800k/prm800k/data/phase2_train.jsonl"
+out_f = "../data/train_prm800k.json"
 # out_f = f"data/lower_data/test_prm800k_{num_samples}samples.json"
 
 records = []
-sample_id = 0
 sampled = []
+unique_question_id = 0
 
 with open(in_f) as fin:
     pbar = tqdm(fin)
-    for sample_id, line in enumerate(pbar):
+    for line in pbar:
         ex = json.loads(line)
         instr = ex["question"]["problem"]
-        # pull the official answer string
         ground_truth = ex["question"].get("ground_truth_answer", "")
-
-        # iterate steps with a step‐index sid
         reason = ex["label"]["finish_reason"]
-        if reason != "solution" and reason != "found_error":
+
+        if reason not in {"solution", "found_error"}:
             continue
-        prev_add_str = ""
+
+        prev_steps = []
+        this_question_records = []
+        skip_question = False
+
         for sid, step_obj in enumerate(ex["label"]["steps"], start=1):
             comps = step_obj.get("completions", [])
             if not comps:
                 continue
+
             for comp in comps:
-                text = comp["text"].strip()
-                add_str = (
-                    prev_add_str + "Step " + str(sid) + ": " + text + "\n\n"
-                )
                 rating = comp["rating"]
                 if rating is None:
                     continue
-                accuracy = rating * 0.5 + 0.5
-                records.append({
-                    "id":           sample_id,      # unique sample ID
-                    "sid":          sid,            # step number within problem
-                    "input":        instr,          # full question prompt
-                    "add":          add_str,        # this single CoT step
-                    "ground_truth": ground_truth,   # correct final answer
-                    "image_path":   "",             # no image for PRM800K
-                    "dataset":      str(sample_id), # domain name
-                    "score":        rating,         # here: human rating {-1, 0, 1}
-                    "times":        1,              # default 1 annotation
-                    "accuracy":     accuracy        # {0, 0.5, 1}
-                })
-                prev_add_str = add_str
 
-while len(sampled) < num_samples:
-    shuffle(records)
-    checked_id_pairs = set() # don't sample the same id and sid pair twice
-    for record in records:
-        if (record["id"], record["sid"]) in checked_id_pairs:
-            continue
-        checked_id_pairs.add((record["id"], record["sid"]))
+                text = comp["text"].strip()
+                step_text = f"Step {sid}: {text}\n\n"
+                prev_steps.append(step_text)
+                add_str = "".join(prev_steps)
+
+                # Accuracy assignment logic
+                if rating == 1:
+                    accuracy = 1.0
+                elif rating == 0:
+                    accuracy = 0.5  # You can change this if you want
+                elif rating == -1:
+                    accuracy = 0.0
+                else:
+                    accuracy = 0.5  # Fallback default
+
+                this_question_records.append({
+                    "id": unique_question_id,       # same ID for steps in one question
+                    "sid": sid,                     # step number
+                    "input": instr,                 # full question
+                    "add": add_str,                 # cumulative step reasoning
+                    "ground_truth": ground_truth,   # final answer
+                    "image_path": "",               # no image
+                    "dataset": str(unique_question_id),  # instance-level dataset
+                    "score": rating,                # original human score
+                    "times": 1,
+                    "accuracy": accuracy
+                })
+
+                break  # only take the first valid completion per step
+
+        if this_question_records:
+            records.extend(this_question_records)
+            unique_question_id += 1
+
+# Shuffle and sample
+shuffle(records)
+id_sid_pairs = set()
+for record in records:
+    pair = (record["id"], record["sid"])
+    if pair not in id_sid_pairs:
+        id_sid_pairs.add(pair)
         sampled.append(record)
-        if len(sampled) >= num_samples:
-            print(f"Sampled {len(sampled)} samples")
-            break
-    else:
-        print(
-            f"Checked all samples and sampled {len(sampled)} samples "
-            f"despite num_samples: {num_samples}"
-        )
+    if len(sampled) >= num_samples:
         break
 
-# write as a single JSON array
+# Save output
 with open(out_f, "w") as fout:
     json.dump(sampled, fout, indent=2)
