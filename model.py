@@ -70,10 +70,12 @@ class Llava_RM(nn.Module):
 
 
 class QwenMath_RM(nn.Module):
-    def __init__(self, device, model_path="/workspace/run1/weights/qwen2.5-math-prm-7b"):
+    def __init__(self, device, args):
         super().__init__()
-        # Load a 2‐class token classification head
-        self.model = AutoModel.from_pretrained(
+        self.args = args
+        model_path = args.reward_model
+
+        self.base_model = AutoModelForCausalLM.from_pretrained(
             model_path, 
             device_map=device, 
             torch_dtype=torch.bfloat16,
@@ -84,27 +86,46 @@ class QwenMath_RM(nn.Module):
             model_path,
             trust_remote_code=True
         )
-        # ID of our step‐separator token
-        self.sep_id = self.tokenizer.convert_tokens_to_ids("<extra_0>")
-        print(self.sep_id)
-        print(self.tokenizer.convert_ids_to_tokens(self.sep_id))
 
-    def make_step_rewards(self, logits, token_masks):
-        # a. Convert logits to probabilities.
-        probabilities = F.softmax(logits, dim=-1)   # [batch_size, seq_len, vocab_size]
-        # b. Mask to only consider <extra_0> positions.
-        probabilities = probabilities * token_masks.unsqueeze(-1) # bs, seq_len, num_labels
+        # Check if <extra_0> token exists, if not add it
+        self.sep_token = "<extra_0>"
+        if self.sep_token not in self.tokenizer.get_vocab():
+            print(f"Adding special token: {self.sep_token}")
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.sep_token]})
+            self.base_model.resize_token_embeddings(len(self.tokenizer))
+            token_added = True
+        else:
+            token_added = False
         
-        all_scores_res = []
-        for i in range(probabilities.size(0)):
-            sample = probabilities[i] # [seq_len, vocab_size]
-            # d. Extract non-zero positions (where <extra_0> tokens are).
-            # Get "correct" class probability
-            positive_probs = sample[sample != 0].view(-1, 2)[:, 1] # valid_tokens, num_labels
-            # non_zero_elements_list = positive_probs.cpu().tolist()
-            # all_scores_res.append(non_zero_elements_list)
-            all_scores_res.append(positive_probs)
-        return all_scores_res
+        self.sep_id = self.tokenizer.convert_tokens_to_ids(self.sep_token)
+        print(f"Separator token ID: {self.sep_id}")
+        
+        # Add classification head - map from hidden_size to 2 classes
+        self.LN = nn.Linear(
+            self.base_model.config.hidden_size, 
+            2, 
+            device=device, 
+            dtype=torch.bfloat16
+        )
+        
+        # Apply PEFT
+        if hasattr(args, 'peft_rank') and args.peft_rank > 0:
+            from peft import LoraConfig, get_peft_model, TaskType
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=args.peft_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            )
+            self.base_model = get_peft_model(self.base_model, peft_config)
+            print("Using PEFT model with LoRA configuration:")
+            print("Trainable parameters in PEFT model:", self.base_model.print_trainable_parameters())
+        else:
+            print("Not using PEFT - training full model")
+
+        # Move to device
+        self.to(device)
     
     def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor):
         """
@@ -114,33 +135,40 @@ class QwenMath_RM(nn.Module):
         Returns:
           final_scores:   [batch_size]  (mean positive class probability over all steps)
         """
-        # a. Pass through PRM base model.
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)  # Shape: [batch_size, seq_len, vocab_size]
-        logits = outputs.logits # [B, T, 2]
-        print("Step rewards:", logits.detach().cpu().numpy())
-
+        # Get hidden states from the causal LM
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        
+        # Get the last hidden states [B, T, hidden_size]
+        hidden_states = outputs.hidden_states[-1]
+        
+        # Apply classification head
+        logits = self.LN(hidden_states).to(dtype=torch.float)
+        
         B, T, _ = logits.shape
 
-        # b. Find all positions where input_ids == sep_id
-        sep_mask = (input_ids == self.sep_id)   # [B, T]
-        # Gather the 2‐class logits at those sep positions:
-        sep_logits = logits[sep_mask]   # [N_steps, 2]
-        print("Sep logits:", sep_logits.detach().cpu().numpy())
-
-        # c. Compute positive‐class probability at each step
-        sep_probs = F.softmax(sep_logits, dim=-1)[:, 1] # [N_steps]
-
-        # d. Reshape back into (B, K) where K may differ per batch
-        batch_counts = sep_mask.sum(dim=1).tolist() # list of length B
-        split_probs  = sep_probs.split(batch_counts)    # tuple of B tensors
-
-        # e. Aggregate across steps per example (mean)
-        # print(list(split_probs))
+        # Find all positions where input_ids == sep_id
+        sep_mask = (input_ids == self.sep_id)
+        
+        # Check if any separator tokens exist
+        if not sep_mask.any():
+            return torch.full((B,), 0.5, device=input_ids.device, dtype=logits.dtype)
+        
+        # Apply softmax and get positive class probabilities
+        probs = F.softmax(logits, dim=-1)[..., 1]  # [B, T]
+        
+        # Gather probabilities at separator positions
+        sep_probs = probs[sep_mask]  # [N_steps]
+        
+        # Reshape back into (B, K) where K may differ per batch
+        batch_counts = sep_mask.sum(dim=1).tolist()
+        split_probs = sep_probs.split(batch_counts)
+        
+        # Aggregate across steps per example (mean)
         final_scores = torch.stack([
-            probs.mean() if probs.numel()>0 else torch.tensor(0.5, device=input_ids.device)
+            probs.mean() if probs.numel() > 0 else torch.tensor(0.5, device=input_ids.device, dtype=logits.dtype)
             for probs in split_probs
-        ], dim=0)   # [B]
-
+        ], dim=0)
+        
         return final_scores
     
 
