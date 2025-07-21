@@ -1,32 +1,37 @@
 # All code is original unless otherwise noted.
 '''
-PYTHONPATH=/workspace/DreamPRM \
 python3 main.py \
-  --train_json_file data/train_prm800k.json \
-  --weights_path outputs/qwen_math_prm_v1 \
+  --train_json_file data/train_prm800k_sorted.json \
+  --weights_path outputs/qwen_math_prm_baseline \
   --batch_size 1 \
   --gradient_accumulation 16 \
-  --lr              1e-5 \
-  --iteration_num   20000 \
-  --save_every_iterations 1000 \
+  --lr 5e-6 \
+  --iteration_num 200 \
+  --save_every_iterations 50 \
   --scheduler_step_size 2000 \
   --scheduler_gamma 0.9 \
-  --weight_decay    1e-4 \
-  --dataset_type    qwen_math \
-  --reward_model    Qwen/Qwen2.5-Math-PRM-7B \
+  --weight_decay 1e-4 \
+  --dataset_type qwen_math \
+  --max_epoch 10 \
+  --reward_model Qwen/Qwen2.5-Math-7B-Instruct \
   --baseline \
-  --device          cuda
+  --device cuda
 '''
 
 import argparse
 import os
+import gc
 import numpy as np
+import pandas as pd
+from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# from transformers import AdamW
-from torch.optim import AdamW
+from transformers import AdamW
+# from torch.optim import AdamW
 import wandb
+
+from peft import LoraConfig, get_peft_model, TaskType
 
 from betty.engine import Engine
 from betty.problems import ImplicitProblem
@@ -71,9 +76,14 @@ parser.add_argument("--max_epoch", type=int, default=120)
 parser.add_argument("--meta_interval", type=int, default=1)
 parser.add_argument("--paint_interval", type=int, default=20)
 parser.add_argument("--dataset_type", type=str, default="qwen_math")
+parser.add_argument("--peft_rank", type=int, default=-1, help="Rank for PEFT, -1 for no PEFT")
+parser.add_argument("--lora_alpha", type=float, default=32.0)
+parser.add_argument("--lora_dropout", type=float, default=0.05)
 
 args = parser.parse_args()
 set_seed(args.seed)
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Prepare data
 domain_list = create_dataset_mapping(args.train_json_file)
@@ -83,6 +93,13 @@ domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
 sampler = None
 resume_idxes = None
 resume_labels = None
+
+step_count = 0
+best_val_loss = float('inf')
+
+epoch_losses = []
+current_epoch = 0
+steps_per_epoch = 0
 
 (
     train_dataloader,
@@ -111,7 +128,7 @@ device = torch.device(args.device)
 if args.dataset_type == "qwen_math":
     # Use BCE for binary classification
     # criterion = nn.BCELoss()
-    criterion = nn.BCEWithLogitsLoss(reduction="mean")
+    criterion = nn.BCELoss(reduction="mean")
     criterion_meta = nn.BCELoss()
 else:
     # Use MSE for regression tasks
@@ -145,14 +162,13 @@ class Upper(ImplicitProblem):
 
         for k in sorted([k for k in batch if k.isdigit()], key=lambda x: int(x)):
             # Text-only input for QwenMath
-            out = self.inner(
+            step_scores = self.inner(
                 batch[k]['input_ids'].to(device),
-                batch[k]['attention_mask'].to(device),
-                # batch[k]['pixel_values'].to(device),
-                # batch[k]['image_grid_thw'].to(device)
+                batch[k]['attention_mask'].to(device)
             )
-            out = out.clamp(1e-8, 1-1e-8)
-            loss_tensor += torch.log(out / (1 - out))
+            # Convert scores to log-odds for aggregation
+            step_scores = step_scores.clamp(1e-8, 1-1e-8)
+            loss_tensor += torch.log(step_scores / (1 - step_scores))
             domains.append(batch[k]['dataset'])
 
         weighted = torch.sigmoid(loss_tensor / len(domains))
@@ -176,6 +192,12 @@ class Upper(ImplicitProblem):
 # Lower Problem (PRM Fine-tuning)
 # ---------------------------------
 class Lower(ImplicitProblem):
+    def __init__(self, name, config):
+        super().__init__(name, config)
+        self.epoch_losses = []
+        self.current_epoch = 0
+        self.steps_per_epoch = len(train_dataloader)  # total steps in one epoch
+
     def forward(self, input_ids, attention_mask):   #, pixel_values, image_grid_thw):
         # torch.cuda.empty_cache()
         return self.module(input_ids, attention_mask)  #, pixel_values, image_grid_thw)
@@ -189,28 +211,59 @@ class Lower(ImplicitProblem):
         mask   = batch['attention_mask'].to(device)
         labels = batch['label'].float().to(device)
         domains = batch.get('dataset', None)
-        # pixel_values = batch['pixel_values'].to(device)
-        # image_grid_thw = batch['image_grid_thw'].to(device)
 
-        # Forward pass
-        logits = self.forward(ids, mask)
-        loss   = criterion(logits, labels)
+        # Forward pass - now returns step-level scores
+        step_scores = self.forward(ids, mask)  # [B] - mean score per sequence
+
+        # Handle labels properly - extract overall correctness
+        if labels.dim() > 1:
+            # If labels is [B, T], extract the overall correctness
+            label_mask = (labels != -100).float()
+            overall_labels = []
+            for i in range(labels.size(0)):
+                valid_positions = label_mask[i].nonzero(as_tuple=True)[0]
+                if len(valid_positions) > 0:
+                    # Take the last valid label (overall problem correctness)
+                    last_pos = valid_positions[-1]
+                    overall_labels.append(labels[i, last_pos])
+                else:
+                    overall_labels.append(0.5)  # Default neutral score
+            labels = torch.stack(overall_labels)  # [B]
+        
+        # Compute loss - use BCE (not BCEWithLogitsLoss) since model returns probabilities
+        loss = F.binary_cross_entropy(step_scores, labels)
+        
+        self.epoch_losses.append(loss.item())
+
+        # Epoch tracking
+        if step_count % self.steps_per_epoch == 0:
+            avg_loss = np.mean(self.epoch_losses)
+            self.current_epoch += 1
+            wandb.log({
+                'epoch/avg_loss': avg_loss,
+                'epoch/number': self.current_epoch
+            }, step=step_count)
+            print(f"\n[Epoch {self.current_epoch}] Average Loss: {avg_loss:.6f}")
+            self.epoch_losses.clear()
 
         lr = self.scheduler.get_last_lr()[0] if hasattr(self, 'scheduler') else args.lr
 
         if args.baseline:
             # Baseline: simple fine-tuning
             wandb.log({'train/loss': loss.item(), 'train/lr': lr}, step=step_count)
-            if step_count % 500 == 0:
+            if step_count % 100 == 0:
                 print(f"Baseline Step {step_count}: loss={loss.item():.4f}, lr={lr:.2e}")
             if hasattr(self, 'scheduler'):
                 self.scheduler.step()
+
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             return loss
         
         else:
             # Meta-learning: instance reweighting
             # Ensure losses tensor shape (batch_size, 1)
-            loss_tensor = loss.unsqueeze(1) if loss.dim()==1 else loss
+            loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss.unsqueeze(1)
             weighted_loss = self.upper(domains, loss_tensor).squeeze()
             wandb.log({'train/weighted_loss': weighted_loss.item(), 'train/lr': lr}, step=step_count)
             if step_count % 500 == 0:
@@ -224,7 +277,8 @@ class Lower(ImplicitProblem):
 
     def configure_module(self):
         # return QwenVL_RM(device)
-        return QwenMath_RM(device, args.reward_model).train()
+        # return QwenMath_RM(device, args.reward_model).train()
+        return QwenMath_RM(device, args).train()
 
     def configure_optimizer(self):
         # optimizer = AdamW(
@@ -252,6 +306,7 @@ class ReweightingEngine(Engine):
     def validation(self):
         global best_loss, step_count
         print(f"[Validation at step {step_count}] Saving model...")
+        torch.cuda.empty_cache()
         # Save the fine-tuned PRM model
         # torch.save(
         #     self.inner.module.LN.state_dict(), f"{args.weights_path}/LN_weights.pt"
@@ -268,6 +323,7 @@ class ReweightingEngine(Engine):
                 "validation/step": step_count,
                 "validation/learning_rate": current_lr,
             })
+            lower_loss.clear()
 
             # save the fine-tuned PRM model.
             lower_problem.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
@@ -309,7 +365,7 @@ lower_config = Config(
     gradient_accumulation=args.gradient_accumulation
 )
 engine_config = EngineConfig(
-    train_iters=args.iteration_num,
+    train_iters=args.iteration_num * args.max_epoch,
     valid_step=args.save_every_iterations,
     # strategy=args.strategy,
     roll_back=args.rollback,
@@ -334,4 +390,6 @@ engine = Engine(
     dependencies={'l2u': {}, 'u2l': dependencies}
 )
 engine.run()
+
+
 
