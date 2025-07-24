@@ -1,20 +1,19 @@
 # All code is original unless otherwise noted.
 '''
 python3 main.py \
-  --train_json_file data/train_prm800k_sorted.json \
-  --weights_path outputs/qwen_math_prm_baseline \
+  --train_json_file data/train_prm800k.json \
+  --meta_json_file data/meta_aime.json \
+  --weights_path outputs/qwen_math_prm_v0 \
   --batch_size 1 \
-  --gradient_accumulation 16 \
-  --lr 5e-6 \
-  --iteration_num 200 \
-  --save_every_iterations 50 \
-  --scheduler_step_size 2000 \
-  --scheduler_gamma 0.9 \
+  --gradient_accumulation 32 \
+  --lr 1e-5 \
+  --iteration_num 3000 \
+  --save_every_iterations 200 \
+  --scheduler_step_size 1000 \
+  --scheduler_gamma 0.95 \
   --weight_decay 1e-4 \
-  --dataset_type qwen_math \
-  --max_epoch 10 \
-  --reward_model Qwen/Qwen2.5-Math-7B-Instruct \
-  --baseline \
+  --max_epoch 15 \
+  --reward_model Qwen/Qwen2.5-Math-1.5B \
   --device cuda
 '''
 
@@ -27,8 +26,8 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from transformers import AdamW
-# from torch.optim import AdamW
+# from transformers import AdamW
+from torch.optim import AdamW
 import wandb
 
 from peft import LoraConfig, get_peft_model, TaskType
@@ -75,7 +74,6 @@ parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--max_epoch", type=int, default=120)
 parser.add_argument("--meta_interval", type=int, default=1)
 parser.add_argument("--paint_interval", type=int, default=20)
-parser.add_argument("--dataset_type", type=str, default="qwen_math")
 parser.add_argument("--peft_rank", type=int, default=-1, help="Rank for PEFT, -1 for no PEFT")
 parser.add_argument("--lora_alpha", type=float, default=32.0)
 parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -86,7 +84,7 @@ set_seed(args.seed)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Prepare data
-domain_list = create_dataset_mapping(args.train_json_file)
+domain_list = create_dataset_mapping(args.train_json_file, args.meta_json_file if not args.baseline else None)
 domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
 # print("Domain to index mapping:", domain_to_idx)
 
@@ -109,8 +107,7 @@ steps_per_epoch = 0
     train_json_file = args.train_json_file,
     meta_json_file=(None if args.baseline else args.meta_json_file),
     train_batch_size= args.batch_size,
-    meta_batch_size= args.batch_size,
-    dataset_type=args.dataset_type
+    meta_batch_size= args.batch_size
 )
 
 # wandb init
@@ -125,15 +122,8 @@ wandb.init(
 device = torch.device(args.device)
 
 # Loss
-if args.dataset_type == "qwen_math":
-    # Use BCE for binary classification
-    # criterion = nn.BCELoss()
-    criterion = nn.BCELoss(reduction="mean")
-    criterion_meta = nn.BCELoss()
-else:
-    # Use MSE for regression tasks
-    criterion = nn.MSELoss()
-    criterion_meta = nn.MSELoss()
+criterion = nn.MSELoss()
+criterion_meta = nn.MSELoss()
 
 # Globals
 step_count = 0
@@ -158,21 +148,28 @@ class Upper(ImplicitProblem):
         # steps = [batch['1'], batch['2'], batch['3'], batch['4'], batch['5'],]
         labels = batch['labels'].to(device)
         loss_tensor = torch.zeros_like(labels)
-        domains = []
+        
+        # Get dataset info from batch level (not per-step)
+        domains = batch['dataset']
 
         for k in sorted([k for k in batch if k.isdigit()], key=lambda x: int(x)):
-            # Text-only input for QwenMath
-            step_scores = self.inner(
+            # Access the lower problem through the dependency system
+            # Instead of searching through self.engine.problems, use self.lower
+            step_scores = self.lower.module(
                 batch[k]['input_ids'].to(device),
                 batch[k]['attention_mask'].to(device)
             )
+            
             # Convert scores to log-odds for aggregation
             step_scores = step_scores.clamp(1e-8, 1-1e-8)
             loss_tensor += torch.log(step_scores / (1 - step_scores))
-            domains.append(batch[k]['dataset'])
 
-        weighted = torch.sigmoid(loss_tensor / len(domains))
-        loss = criterion(weighted, labels)
+        # ① get a per‑example weight w_i ∈ ℝ  (or logit) from the table
+        #    NB: you already wrote the wrapper in forward()
+        #    pass *something* that identifies the group/domain plus the raw loss
+        weights = self.forward(batch['dataset'], step_scores.detach())   # [B]
+        # ② apply the weights
+        loss = (weights * (step_scores - labels) ** 2).mean()            # weighted MSE
         return {'loss': loss}
 
     def configure_train_data_loader(self):
@@ -231,7 +228,7 @@ class Lower(ImplicitProblem):
             labels = torch.stack(overall_labels)  # [B]
         
         # Compute loss - use BCE (not BCEWithLogitsLoss) since model returns probabilities
-        loss = F.binary_cross_entropy(step_scores, labels)
+        loss = criterion(step_scores, labels)
         
         self.epoch_losses.append(loss.item())
 
@@ -281,11 +278,6 @@ class Lower(ImplicitProblem):
         return QwenMath_RM(device, args).train()
 
     def configure_optimizer(self):
-        # optimizer = AdamW(
-        #     self.module.parameters(),
-        #     lr=args.lr,
-        # )
-        # return optimizer
         return torch.optim.Adam(
             self.module.parameters(),
             lr=args.lr,
@@ -307,11 +299,6 @@ class ReweightingEngine(Engine):
         global best_loss, step_count
         print(f"[Validation at step {step_count}] Saving model...")
         torch.cuda.empty_cache()
-        # Save the fine-tuned PRM model
-        # torch.save(
-        #     self.inner.module.LN.state_dict(), f"{args.weights_path}/LN_weights.pt"
-        # )
-        # self.inner.module.base_model.save_pretrained(f"{args.weights_path}/base_model")
 
         if args.baseline:
             # Baseline mode: only fine-tune the lower problem.
@@ -355,15 +342,14 @@ class ReweightingEngine(Engine):
         return {"loss": best_loss}
     
 
-# upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
-# lower_config = Config(type="darts", precision=args.precision, unroll_steps=args.unroll_steps,
-#                     gradient_accumulation=args.gradient_accumulation)
-upper_config = Config(type="darts", retain_graph=True)
+upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
 lower_config = Config(
-    type='darts',
+    type="darts", 
+    precision=args.precision, 
     unroll_steps=args.unroll_steps,
     gradient_accumulation=args.gradient_accumulation
 )
+
 engine_config = EngineConfig(
     train_iters=args.iteration_num * args.max_epoch,
     valid_step=args.save_every_iterations,
@@ -374,22 +360,28 @@ engine_config = EngineConfig(
 
 # Instantiate problems
 problems = [Lower(name='lower', config=lower_config)]
-dependencies = {}
 
 if not args.baseline:
     problems.insert(0, Upper(name='upper', config=upper_config))
-    dependencies = {problems[0]: [problems[1]]}
+    
+    # Define bidirectional dependencies
+    upper_problem = problems[0]  # Upper problem
+    lower_problem = problems[1]  # Lower problem
+    
+    dependencies = {
+        'l2u': {lower_problem: [upper_problem]},  # Lower depends on Upper (since Lower calls self.upper)
+        'u2l': {upper_problem: [lower_problem]}   # Upper depends on Lower (bilevel structure)
+    }
     print("Running META-LEARNING mode")
 else:
+    dependencies = {'l2u': {}, 'u2l': {}}
     print("Running BASELINE mode")
 
 # Run
 engine = Engine(
     config=engine_config,
     problems=problems,
-    dependencies={'l2u': {}, 'u2l': dependencies}
+    dependencies=dependencies
 )
 engine.run()
-
-
 
