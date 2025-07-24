@@ -6,10 +6,14 @@ python3 main.py \
   --weights_path outputs/qwen_math_prm_v0 \
   --batch_size 1 \
   --gradient_accumulation 32 \
+  --peft_rank 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.1 \
   --lr 1e-5 \
   --iteration_num 3000 \
   --save_every_iterations 200 \
   --scheduler_step_size 1000 \
+  --unroll_steps 3 \
   --scheduler_gamma 0.95 \
   --weight_decay 1e-4 \
   --max_epoch 15 \
@@ -168,8 +172,10 @@ class Upper(ImplicitProblem):
         #    NB: you already wrote the wrapper in forward()
         #    pass *something* that identifies the group/domain plus the raw loss
         weights = self.forward(batch['dataset'], step_scores.detach())   # [B]
+        
         # ② apply the weights
         loss = (weights * (step_scores - labels) ** 2).mean()            # weighted MSE
+        
         return {'loss': loss}
 
     def configure_train_data_loader(self):
@@ -227,7 +233,7 @@ class Lower(ImplicitProblem):
                     overall_labels.append(0.5)  # Default neutral score
             labels = torch.stack(overall_labels)  # [B]
         
-        # Compute loss - use BCE (not BCEWithLogitsLoss) since model returns probabilities
+        # Compute loss
         loss = criterion(step_scores, labels)
         
         self.epoch_losses.append(loss.item())
@@ -262,6 +268,7 @@ class Lower(ImplicitProblem):
             # Ensure losses tensor shape (batch_size, 1)
             loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss.unsqueeze(1)
             weighted_loss = self.upper(domains, loss_tensor).squeeze()
+            
             wandb.log({'train/weighted_loss': weighted_loss.item(), 'train/lr': lr}, step=step_count)
             if step_count % 500 == 0:
                 print(f"Meta Step {step_count}: weighted_loss={weighted_loss.item():.4f}, lr={lr:.2e}")
@@ -359,25 +366,29 @@ engine_config = EngineConfig(
 )
 
 # Instantiate problems
-problems = [Lower(name='lower', config=lower_config)]
-
-if not args.baseline:
-    problems.insert(0, Upper(name='upper', config=upper_config))
+if args.baseline:
+    problems = [Lower(name='lower', config=lower_config)]
+    dependencies = {'l2u': {}, 'u2l': {}}
+    print("Running BASELINE mode")
+else:
+    upper_problem = Upper(name='upper', config=upper_config)
+    lower_problem = Lower(name='lower', config=lower_config)
+    problems = [upper_problem, lower_problem]
     
-    # Define bidirectional dependencies
-    upper_problem = problems[0]  # Upper problem
-    lower_problem = problems[1]  # Lower problem
-    
+    # Define bidirectional dependencies properly
     dependencies = {
         'l2u': {lower_problem: [upper_problem]},  # Lower depends on Upper (since Lower calls self.upper)
         'u2l': {upper_problem: [lower_problem]}   # Upper depends on Lower (bilevel structure)
     }
     print("Running META-LEARNING mode")
-else:
-    dependencies = {'l2u': {}, 'u2l': {}}
-    print("Running BASELINE mode")
 
 # Run
+# engine = ReweightingEngine(
+#     config=engine_config,
+#     problems=problems,
+#     dependencies=dependencies
+# )
+
 engine = Engine(
     config=engine_config,
     problems=problems,
