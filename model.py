@@ -112,9 +112,20 @@ class QwenMath_RM(nn.Module):
                 target_modules=[
                     "q_proj", "k_proj", "v_proj", "o_proj",
                     "gate_proj", "up_proj", "down_proj"
-                ]
+                ],
+                bias="none",
+                inference_mode=False,
             )
             self.base_model = get_peft_model(self.base_model, peft_config)
+
+            # Enable gradients for LoRA layers
+            self.base_model.enable_input_require_grads()
+
+            # Make sure LoRA parameters require gradients
+            for name, param in self.base_model.named_parameters():
+                if 'lora_' in name:
+                    param.requires_grad = True
+            
             print("Using LoRA with Qwen2.5-Math-1.5B:")
             self.base_model.print_trainable_parameters()
         
@@ -125,6 +136,10 @@ class QwenMath_RM(nn.Module):
 
         # Move to device
         self.to(device)
+
+        # Ensure classification head always requires gradients
+        for param in self.LN.parameters():
+            param.requires_grad = True
     
     def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor):
         """
@@ -156,8 +171,11 @@ class QwenMath_RM(nn.Module):
         
         # Apply classification head
         logits = self.LN(last_hidden_states)  # [B, num_classes]
+
         # Method 1: Compute expected score
         class_scores = torch.tensor([0.0, 0.5, 1.0], device=logits.device, dtype=logits.dtype)
+        # probs = torch.softmax(logits, dim=-1)  # [B, 3]
+        # output = torch.sum(probs * class_scores, dim=-1)  # [B]
         output = torch.sum(logits * class_scores, dim=-1)  # [batch_size]
         return output  # [batch_size]
         
