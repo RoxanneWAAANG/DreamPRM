@@ -1,5 +1,6 @@
 # from transformers import Qwen2VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration
 from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModelForCausalLM
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 import torch
@@ -73,6 +74,7 @@ class QwenMath_RM(nn.Module):
     def __init__(self, device, args):
         super().__init__()
         self.args = args
+        self.device = device
         model_path = args.reward_model
 
         self.base_model = AutoModelForCausalLM.from_pretrained(
@@ -84,29 +86,20 @@ class QwenMath_RM(nn.Module):
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
+            pad_token='<pad>',
+            pad_token_id=0,
             trust_remote_code=True
         )
-
-        # Check if <extra_0> token exists, if not add it
-        self.sep_token = "<extra_0>"
-        if self.sep_token not in self.tokenizer.get_vocab():
-            print(f"Adding special token: {self.sep_token}")
-            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.sep_token]})
-            self.base_model.resize_token_embeddings(len(self.tokenizer))
-            token_added = True
-        else:
-            token_added = False
-        
-        self.sep_id = self.tokenizer.convert_tokens_to_ids(self.sep_token)
-        print(f"Separator token ID: {self.sep_id}")
         
         # Add classification head - map from hidden_size to 2 classes
         self.LN = nn.Linear(
             self.base_model.config.hidden_size, 
-            2, 
+            3, 
             device=device, 
             dtype=torch.bfloat16
         )
+
+        self.sigmoid = nn.Sigmoid()
         
         # Apply PEFT
         if hasattr(args, 'peft_rank') and args.peft_rank > 0:
@@ -114,15 +107,21 @@ class QwenMath_RM(nn.Module):
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=args.peft_rank,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+                lora_alpha=getattr(args, 'lora_alpha', 32),
+                lora_dropout=getattr(args, 'lora_dropout', 0.1),
+                target_modules=[
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"
+                ]
             )
             self.base_model = get_peft_model(self.base_model, peft_config)
-            print("Using PEFT model with LoRA configuration:")
-            print("Trainable parameters in PEFT model:", self.base_model.print_trainable_parameters())
-        else:
-            print("Not using PEFT - training full model")
+            print("Using LoRA with Qwen2.5-Math-1.5B:")
+            self.base_model.print_trainable_parameters()
+        
+        if getattr(args, 'freeze_base_model', False):
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+            print("Base model frozen, only training classification head")
 
         # Move to device
         self.to(device)
@@ -135,41 +134,36 @@ class QwenMath_RM(nn.Module):
         Returns:
           final_scores:   [batch_size]  (mean positive class probability over all steps)
         """
-        # Get hidden states from the causal LM
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        batch_size = input_ids.size(0)
         
-        # Get the last hidden states [B, T, hidden_size]
-        hidden_states = outputs.hidden_states[-1]
+        # Get hidden states from the causal LM
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False
+            )
+        
+        # Get the last hidden states
+        hidden_states = outputs.hidden_states[-1]  # [B, T, hidden_size]
+        # print("Hidden states shape:", hidden_states.shape)
+        
+        # Apply classification head - keep in bfloat16 for efficiency
+        sequence_lengths = attention_mask.sum(dim=1) - 1  # [B]
+        batch_indices = torch.arange(batch_size, device=input_ids.device)
+        last_hidden_states = hidden_states[batch_indices, sequence_lengths]  # [B, hidden_size]
         
         # Apply classification head
-        logits = self.LN(hidden_states).to(dtype=torch.float)
+        logits = self.LN(last_hidden_states)  # [B, num_classes]
+        # Method 1: Compute expected score
+        class_scores = torch.tensor([0.0, 0.5, 1.0], device=logits.device, dtype=logits.dtype)
+        output = torch.sum(logits * class_scores, dim=-1)  # [batch_size]
+        return output  # [batch_size]
         
-        B, T, _ = logits.shape
-
-        # Find all positions where input_ids == sep_id
-        sep_mask = (input_ids == self.sep_id)
-        
-        # Check if any separator tokens exist
-        if not sep_mask.any():
-            return torch.full((B,), 0.5, device=input_ids.device, dtype=logits.dtype)
-        
-        # Apply softmax and get positive class probabilities
-        probs = F.softmax(logits, dim=-1)[..., 1]  # [B, T]
-        
-        # Gather probabilities at separator positions
-        sep_probs = probs[sep_mask]  # [N_steps]
-        
-        # Reshape back into (B, K) where K may differ per batch
-        batch_counts = sep_mask.sum(dim=1).tolist()
-        split_probs = sep_probs.split(batch_counts)
-        
-        # Aggregate across steps per example (mean)
-        final_scores = torch.stack([
-            probs.mean() if probs.numel() > 0 else torch.tensor(0.5, device=input_ids.device, dtype=logits.dtype)
-            for probs in split_probs
-        ], dim=0)
-        
-        return final_scores
+        # Method 2: Use max class probability
+        # max_class = torch.argmax(logits, dim=-1)  # [batch_size]
+        # return class_scores[max_class]
     
 
 class InstanceTable(nn.Module):
