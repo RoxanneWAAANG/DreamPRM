@@ -184,26 +184,26 @@ class MyDataset_QwenMath(Dataset):
         item = self.records[idx]
         prompt = item['input']
         add = item['add']
-        label = float(item.get('score', item.get('accuracy', 0)))
-        dataset = item.get('dataset', 'prm800k')
+        label = float(item.get('accuracy', item.get('score', 0)))
+        # Use the actual dataset field (which contains problem id) for instance reweighting
+        dataset = item.get('dataset', str(item.get('id', idx)))
 
-        # Build the PRM-formatted message
         messages = [
             {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-            {"role": "user",   "content": prompt},
-            {"role": "assistant", "content": add + "<extra_0>"}
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": add}
         ]
         
         text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+            messages,
+            tokenize=False,
+            add_generation_prompt=False
         )
 
         inputs = self.tokenizer(
             text=[text],
-            padding=True,
-            truncation=True,
-            max_length=2048,
-            return_tensors="pt"
+            return_tensors="pt",
+            add_special_tokens=False
         )
         
         return {
@@ -316,41 +316,39 @@ class MyMetaDataset_QwenMath(Dataset):
     def __init__(self, records, tokenizer):
         self.records = records
         self.tokenizer = tokenizer
-        self.sep_token = "<extra_0>"
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
-        item = self.records[idx]
-        full_input = item['input']
-        label = float(item['true_false'])
-        dataset = item.get('dataset', 'aime')
+        record = self.records[idx]
+        input_text = record['input']
+        label = float(record['true_false'])
+
+        # Get dataset identifier
+        dataset = record.get('id', str(idx))
 
         # Split into steps by separator
-        raw_steps = full_input.split(self.sep_token)
+        raw_steps = input_text.split("\n\n<extra_0>")
         steps = [s.strip() for s in raw_steps if s.strip()]
 
         r_dict = {}
         for i, step in enumerate(steps, start=1):
-            # Wrap each step as a PRM message
             messages = [
-                {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-                {"role": "user",   "content": item.get('question', '')},
-                {"role": "assistant", "content": step + self.sep_token}
+                {"role": "user", "content": step}
             ]
             text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
             )
             inputs = self.tokenizer(
                 text=[text],
                 padding=True,
-                truncation=True,
-                max_length=2048,
                 return_tensors="pt"
-            )
+            ).to("cuda")
             r_dict[str(i)] = {
-                'input_ids':      inputs['input_ids'].squeeze(0),
+                'input_ids': inputs['input_ids'].squeeze(0),
                 'attention_mask': inputs['attention_mask'].squeeze(0)
             }
         r_dict['labels'] = torch.tensor(label, dtype=torch.float)
@@ -387,7 +385,8 @@ def meta_collate_fn(batch):
     for k in step_keys:
         collated[k] = {
             'input_ids':      torch.stack([b[k]['input_ids'] for b in batch]),
-            'attention_mask': torch.stack([b[k]['attention_mask'] for b in batch])
+            'attention_mask': torch.stack([b[k]['attention_mask'] for b in batch]),
+            'dataset':        [b['dataset'] for b in batch]
         }
     return collated
 
@@ -397,11 +396,10 @@ def build_dataloader(
     train_json_file,
     meta_json_file,
     train_batch_size,
-    meta_batch_size,
-    dataset_type="qwen_math"
+    meta_batch_size
 ):
-    # Only for QwenMath
     tokenizer = AutoTokenizer.from_pretrained(processor_path, trust_remote_code=True)
+    
     # Load train data
     train_records = read_json(train_json_file)
     train_dataset = MyDataset_QwenMath(train_records, tokenizer)
@@ -415,9 +413,6 @@ def build_dataloader(
     # Load meta data if provided
     if meta_json_file:
         meta_records = read_json(meta_json_file)
-        # ensure dataset tag
-        for rec in meta_records:
-            rec.setdefault('dataset', 'aime')
         meta_dataset = MyMetaDataset_QwenMath(meta_records, tokenizer)
         meta_loader = DataLoader(
             meta_dataset,
@@ -428,5 +423,7 @@ def build_dataloader(
     else:
         meta_loader = None
 
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Meta samples: {len(meta_dataset) if meta_loader else 0}")
     return train_loader, meta_loader
 
