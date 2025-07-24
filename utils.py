@@ -118,38 +118,71 @@ def generate_reward_model_input_math(input, response_step, processor):
     return inputs
 
 
-def create_dataset_mapping(json_file_path):
-    """
-    从JSON文件中提取所有唯一的dataset名称，并创建一个从0开始递增的数字映射字典
-    支持视觉数据集和数学数据集两种格式
+# def create_dataset_mapping(json_file_path):
+#     """
+#     从JSON文件中提取所有唯一的dataset名称，并创建一个从0开始递增的数字映射字典
+#     支持视觉数据集和数学数据集两种格式
 
-    参数:
-    json_file_path: JSON文件路径
+#     参数:
+#     json_file_path: JSON文件路径
 
-    返回:
-    一个字典，格式为 {dataset_name1: 0, dataset_name2: 1, ...}
-    """
-    # 读取JSON文件
-    with open(json_file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+#     返回:
+#     一个字典，格式为 {dataset_name1: 0, dataset_name2: 1, ...}
+#     """
+#     # 读取JSON文件
+#     with open(json_file_path, 'r', encoding='utf-8') as f:
+#         data = json.load(f)
 
-    # 检查数据集类型并提取唯一标识符
-    unique_identifiers = set()
+#     # 检查数据集类型并提取唯一标识符
+#     unique_identifiers = set()
     
-    # 检查是否为数学数据集（没有image_path但有id字段）
-    if data and "image_path" not in data[0] and "id" in data[0]:
-        # 数学数据集：使用problem_id作为域标识
-        for item in data:
-            if "id" in item:
-                unique_identifiers.add(f"problem_{item['id']}")
-    else:
-        # 视觉数据集：使用dataset字段
-        for item in data:
-            if "dataset" in item:
-                unique_identifiers.add(item["dataset"])
+#     # 检查是否为数学数据集（没有image_path但有id字段）
+#     if data and "image_path" not in data[0] and "id" in data[0]:
+#         # 数学数据集：使用problem_id作为域标识
+#         for item in data:
+#             if "id" in item:
+#                 unique_identifiers.add(f"problem_{item['id']}")
+#     else:
+#         # 视觉数据集：使用dataset字段
+#         for item in data:
+#             if "dataset" in item:
+#                 unique_identifiers.add(item["dataset"])
 
-    # 创建映射字典（按字母排序）
-    sorted_identifiers = sorted(list(unique_identifiers))
-    mapping = {identifier: idx for idx, identifier in enumerate(sorted_identifiers)}
+#     # 创建映射字典（按字母排序）
+#     sorted_identifiers = sorted(list(unique_identifiers))
+#     mapping = {identifier: idx for idx, identifier in enumerate(sorted_identifiers)}
 
-    return mapping
+#     return mapping
+
+def create_dataset_mapping(train_json_file, aime_json_file=None):
+    import json
+    
+    domain_set = set()
+    
+    # 1. 处理PRM数据
+    print(f"Loading PRM domains from: {train_json_file}")
+    with open(train_json_file, 'r') as f:
+        prm_data = json.load(f)
+    
+    for record in prm_data:
+        domain_id = record.get('dataset', record.get('id'))
+        if domain_id:
+            domain_set.add(str(domain_id))
+    
+    print(f"PRM domains: {len(domain_set)}")
+    
+    # 2. 处理AIME数据
+    if aime_json_file:
+        print(f"Loading AIME domains from: {aime_json_file}")
+        with open(aime_json_file, 'r') as f:
+            aime_data = json.load(f)
+        
+        for record in aime_data:
+            domain_id = record.get('id', record.get('dataset'))
+            if domain_id:
+                domain_set.add(str(domain_id))
+    
+    domain_list = sorted(list(domain_set))
+    print(f"Total domains: {len(domain_list)}")
+    
+    return domain_list
