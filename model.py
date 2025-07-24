@@ -162,6 +162,7 @@ class QwenMath_RM(nn.Module):
         
         # Get the last hidden states
         hidden_states = outputs.hidden_states[-1]  # [B, T, hidden_size]
+        del outputs # Free memory from outputs
         # print("Hidden states shape:", hidden_states.shape)
         
         # Apply classification head - keep in bfloat16 for efficiency
