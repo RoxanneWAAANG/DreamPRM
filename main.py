@@ -6,17 +6,15 @@ python3 main.py \
   --weights_path outputs/qwen_math_prm_v0 \
   --batch_size 1 \
   --gradient_accumulation 32 \
-  --peft_rank 16 \
-  --lora_alpha 32 \
-  --lora_dropout 0.1 \
   --lr 1e-5 \
   --iteration_num 3000 \
   --save_every_iterations 200 \
   --scheduler_step_size 1000 \
   --unroll_steps 3 \
+  --precision bf16 \
   --scheduler_gamma 0.95 \
   --weight_decay 1e-4 \
-  --max_epoch 15 \
+  --max_epoch 10 \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
   --device cuda
 '''
@@ -247,6 +245,20 @@ class Lower(ImplicitProblem):
                 'epoch/number': self.current_epoch
             }, step=step_count)
             print(f"\n[Epoch {self.current_epoch}] Average Loss: {avg_loss:.6f}")
+
+            # ==== Save model each epoch ==============================================
+            save_path = f"{args.weights_path}/qwen_math_prm/epoch_{self.current_epoch}"
+            os.makedirs(save_path, exist_ok=True)
+
+            # 1) 保存下层 PRM（权重 + tokenizer）
+            self.module.base_model.save_pretrained(save_path)
+            self.module.tokenizer.save_pretrained(save_path)
+
+            # 2) 如果是 META 模式，再把上层 InstanceTable 也存一下
+            if not args.baseline and hasattr(self, 'upper'):
+                torch.save(f"{args.weights_path}/domain_weights.pt")
+            # =========================================================================
+
             self.epoch_losses.clear()
 
         lr = self.scheduler.get_last_lr()[0] if hasattr(self, 'scheduler') else args.lr
@@ -384,11 +396,6 @@ else:
 
 # Run
 # engine = ReweightingEngine(
-#     config=engine_config,
-#     problems=problems,
-#     dependencies=dependencies
-# )
-
 engine = Engine(
     config=engine_config,
     problems=problems,
@@ -396,3 +403,18 @@ engine = Engine(
 )
 engine.run()
 
+print("Training completed, saving models...")
+
+save_path = f"{args.weights_path}/qwen_math_prm"
+os.makedirs(save_path, exist_ok=True)
+lower_problem.module.base_model.save_pretrained(save_path)
+lower_problem.module.tokenizer.save_pretrained(save_path)
+
+if not args.baseline:
+    # Save the upper problem's state dict
+    upper_problem.state_dict().save(f"{args.weights_path}/domain_weights.pt")
+
+wandb.finish()
+
+# Clear memory
+torch.cuda.empty_cache()
