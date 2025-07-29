@@ -176,8 +176,8 @@ class InstanceTable(nn.Module):
         self.instance_to_idx = instance_to_idx
         self.num_instance = len(instance_to_idx)
 
-        # self.raw_weights = nn.Parameter(torch.zeros(self.num_instance))  # 初始为1
-        self.raw_weights = nn.Parameter(torch.ones(self.num_instance))  # initialize to 1
+        self.raw_weights = nn.Parameter(torch.zeros(self.num_instance))  # 初始为1
+        # self.raw_weights = nn.Parameter(torch.ones(self.num_instance))  # initialize to 1
         # self.relu = torch.nn.ReLU()
         # self.eps = eps  # Small value to avoid division by zero
 
