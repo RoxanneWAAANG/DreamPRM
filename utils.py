@@ -151,38 +151,22 @@ def generate_reward_model_input_math(input, response_step, processor):
 #     # 创建映射字典（按字母排序）
 #     sorted_identifiers = sorted(list(unique_identifiers))
 #     mapping = {identifier: idx for idx, identifier in enumerate(sorted_identifiers)}
+#     print(f"Created dataset mapping: {mapping}")
 
 #     return mapping
 
-def create_dataset_mapping(train_json_file, aime_json_file=None):
-    import json
-    
-    domain_set = set()
-    
-    # 1. 处理PRM数据
-    print(f"Loading PRM domains from: {train_json_file}")
-    with open(train_json_file, 'r') as f:
-        prm_data = json.load(f)
-    
-    for record in prm_data:
-        domain_id = record.get('dataset', record.get('id'))
-        if domain_id:
-            domain_set.add(str(domain_id))
-    
-    print(f"PRM domains: {len(domain_set)}")
-    
-    # 2. 处理AIME数据
-    if aime_json_file:
-        print(f"Loading AIME domains from: {aime_json_file}")
-        with open(aime_json_file, 'r') as f:
-            aime_data = json.load(f)
-        
-        for record in aime_data:
-            domain_id = record.get('id', record.get('dataset'))
-            if domain_id:
-                domain_set.add(str(domain_id))
-    
-    domain_list = sorted(list(domain_set))
-    print(f"Total domains: {len(domain_list)}")
-    
-    return domain_list
+
+def create_dataset_mapping(json_file_path):
+    with open(json_file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    unique_datasets = set()
+    for item in data:
+        if "dataset" in item:
+            unique_datasets.add(item["dataset"])
+
+    sorted_datasets = sorted(list(unique_datasets))
+    mapping = {dataset: idx for idx, dataset in enumerate(sorted_datasets)}
+
+    return mapping
+
