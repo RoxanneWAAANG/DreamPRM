@@ -5,7 +5,7 @@ python3 main.py \
   --meta_json_file data/meta_aime.json \
   --weights_path outputs/qwen_math_prm_v0 \
   --batch_size 1 \
-  --gradient_accumulation 16 \
+  --gradient_accumulation 32 \
   --lr 1e-5 \
   --iteration_num 1000 \
   --save_every_iterations 200 \
@@ -198,6 +198,7 @@ class Lower(ImplicitProblem):
 
         # Forward pass - now returns step-level scores
         step_scores = self.forward(ids, mask)  # [B] - mean score per sequence
+        torch.cuda.empty_cache()
 
         # Handle labels properly - extract overall correctness
         if labels.dim() > 1:
@@ -216,6 +217,8 @@ class Lower(ImplicitProblem):
         
         # Compute loss
         loss = criterion(step_scores, labels)
+        del step_scores
+        torch.cuda.empty_cache()
         
         # Track losses for logging
         self.epoch_losses.append(loss.item())
@@ -252,14 +255,10 @@ class Lower(ImplicitProblem):
 
         # Meta-learning: domain reweighting
         # This is where domain reweighting happens - domains come from PRM800K data
-        if domains is not None:
-            # Ensure loss tensor has correct shape for InstanceTable
-            loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss.unsqueeze(1)
-            # Apply domain reweighting through the upper problem
-            weighted_loss = self.upper(domains, loss_tensor).squeeze()
-        else:
-            # Fallback if no domain info
-            weighted_loss = loss
+        # Ensure loss tensor has correct shape for InstanceTable
+        loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss.unsqueeze(1)
+        # Apply domain reweighting through the upper problem
+        weighted_loss = self.upper(domains, loss_tensor).squeeze()
         
         # Track the weighted loss for validation
         lower_weighted_loss.append(weighted_loss.item())
@@ -289,6 +288,8 @@ class Lower(ImplicitProblem):
             lower_loss.clear()
             lower_weighted_loss.clear()
         
+        del loss_tensor
+        torch.cuda.empty_cache()
         return weighted_loss
 
     def configure_train_data_loader(self):
