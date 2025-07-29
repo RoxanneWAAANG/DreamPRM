@@ -166,24 +166,25 @@ class QwenMath_RM(nn.Module):
     
 
 class InstanceTable(nn.Module):
-    def __init__(self, domain_to_idx, eps=1e-8):
+    def __init__(self, instance_to_idx, eps=1e-8):
         """
         Args:
-            domain_to_idx (dict):
+            instance_to_idx (dict):
                 字符串 -> 整数索引 的映射，例如 {"domain_a": 0, "domain_b": 1}。
         """
         super(InstanceTable, self).__init__()
-        self.domain_to_idx = domain_to_idx
-        self.num_domains = len(domain_to_idx)
+        self.instance_to_idx = instance_to_idx
+        self.num_instance = len(instance_to_idx)
 
-        self.raw_weights = nn.Parameter(torch.zeros(self.num_domains))  # 初始为1
+        # self.raw_weights = nn.Parameter(torch.zeros(self.num_instance))  # 初始为1
+        self.raw_weights = nn.Parameter(torch.ones(self.num_instance))  # initialize to 1
         # self.relu = torch.nn.ReLU()
         # self.eps = eps  # Small value to avoid division by zero
 
-    def forward(self, domain_strings, x):
+    def forward(self, instance_strings, x):
         """
         Args:
-            domain_strings (list[str] or tuple[str]):
+            instance_strings (list[str] or tuple[str]):
                 每个样本对应的 domain 名称，长度与 x 的 batch_size 相同。
             x (torch.Tensor):
                 形状为 (batch_size, 1)，表示每个样本一个数值。
@@ -197,16 +198,16 @@ class InstanceTable(nn.Module):
         positive_weights = self.raw_weights
 
         # map domains → weights
-        idxes = [self.domain_to_idx[d] for d in domain_strings]
+        idxes = [self.instance_to_idx[d] for d in instance_strings]
         idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
 
-        # Retrieve domain weights for each sample in the batch [batch_size].
-        domain_weights = positive_weights[idxes]
+        # Retrieve instance weights for each sample in the batch [batch_size].
+        instance_weights = positive_weights[idxes]
         # Reshape weights to match input tensor dimensions [batch_size, 1].
-        domain_weights = domain_weights.view(-1, 1)
+        instance_weights = instance_weights.view(-1, 1)
 
-        # Element-wise multiplication: each input value multiplied by its domain weight.
-        out = x * domain_weights
+        # Element-wise multiplication: each input value multiplied by its instance weight.
+        out = x * instance_weights
         return out
 
 
