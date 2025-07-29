@@ -2,9 +2,14 @@
 from transformers import AutoModel, AutoTokenizer
 from transformers import AutoModelForCausalLM
 import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model
+# from peft import LoraConfig, get_peft_model
 import torch
 import torch.nn as nn
+
+if not hasattr(nn, "RMSNorm"):
+    # from transformers.models.qwen2.modeling_qwen2 import RMSNorm 
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
+    nn.RMSNorm = RMSNorm
 
 # # Define LoRA configuration
 # lora_config = LoraConfig(
@@ -82,12 +87,11 @@ class QwenMath_RM(nn.Module):
             device_map=device, 
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            pad_token='<pad>',
-            pad_token_id=0,
             trust_remote_code=True
         )
         
@@ -99,40 +103,12 @@ class QwenMath_RM(nn.Module):
             dtype=torch.bfloat16
         )
 
-        self.sigmoid = nn.Sigmoid()
-        
-        # Apply PEFT
-        if hasattr(args, 'peft_rank') and args.peft_rank > 0:
-            from peft import LoraConfig, get_peft_model, TaskType
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=args.peft_rank,
-                lora_alpha=getattr(args, 'lora_alpha', 32),
-                lora_dropout=getattr(args, 'lora_dropout', 0.1),
-                target_modules=[
-                    "q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"
-                ],
-                bias="none",
-                inference_mode=False,
-            )
-            self.base_model = get_peft_model(self.base_model, peft_config)
+        self.softmax = nn.Softmax(dim=-1)
+        # Set temperature for softmax
+        self.temperature = getattr(args, 'temperature', 2.0)
 
-            # Enable gradients for LoRA layers
-            self.base_model.enable_input_require_grads()
-
-            # Make sure LoRA parameters require gradients
-            for name, param in self.base_model.named_parameters():
-                if 'lora_' in name:
-                    param.requires_grad = True
-            
-            print("Using LoRA with Qwen2.5-Math-1.5B:")
-            self.base_model.print_trainable_parameters()
-        
-        if getattr(args, 'freeze_base_model', False):
-            for param in self.base_model.parameters():
-                param.requires_grad = False
-            print("Base model frozen, only training classification head")
+        # Register class scores as a buffer
+        self.register_buffer('class_scores', torch.tensor([0.0, 0.5, 1.0], dtype=torch.bfloat16))
 
         # Move to device
         self.to(device)
@@ -152,13 +128,12 @@ class QwenMath_RM(nn.Module):
         batch_size = input_ids.size(0)
         
         # Get hidden states from the causal LM
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            outputs = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False
-            )
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False
+        )
         
         # Get the last hidden states
         hidden_states = outputs.hidden_states[-1]  # [B, T, hidden_size]
@@ -167,22 +142,27 @@ class QwenMath_RM(nn.Module):
         
         # Apply classification head - keep in bfloat16 for efficiency
         sequence_lengths = attention_mask.sum(dim=1) - 1  # [B]
+        # Clamp to avoid negative indices
+        sequence_lengths = torch.clamp(sequence_lengths, min=0)
+        # Get the last hidden state for each sequence
         batch_indices = torch.arange(batch_size, device=input_ids.device)
+        # Use advanced indexing to get the last hidden states for each sequence
         last_hidden_states = hidden_states[batch_indices, sequence_lengths]  # [B, hidden_size]
+        del hidden_states # Free memory from hidden_states
         
         # Apply classification head
-        logits = self.LN(last_hidden_states)  # [B, num_classes]
+        logits = self.LN(last_hidden_states)  # [B, 3]
 
-        # Method 1: Compute expected score
-        class_scores = torch.tensor([0.0, 0.5, 1.0], device=logits.device, dtype=logits.dtype)
-        # probs = torch.softmax(logits, dim=-1)  # [B, 3]
-        # output = torch.sum(probs * class_scores, dim=-1)  # [B]
-        output = torch.sum(logits * class_scores, dim=-1)  # [batch_size]
+        # Calculate probabilities using softmax with temperature
+        probs = self.softmax(logits / self.temperature)  # [B, 3]
+        # print("Probabilities shape:", probs.shape)
+        # print("Probabilities:", probs)
+        # Calculate final output as weighted sum of class scores
+        output = torch.sum(probs * self.class_scores, dim=-1)  # [B]
+        # Clamp output to [0, 1] range
+        output = torch.clamp(output, min=0.0, max=1.0)
+        # print("Final output shape:", output.shape)
         return output  # [batch_size]
-        
-        # Method 2: Use max class probability
-        # max_class = torch.argmax(logits, dim=-1)  # [batch_size]
-        # return class_scores[max_class]
     
 
 class InstanceTable(nn.Module):
@@ -196,11 +176,9 @@ class InstanceTable(nn.Module):
         self.domain_to_idx = domain_to_idx
         self.num_domains = len(domain_to_idx)
 
-        # start from balanced importance
-        init_val = 1.0
-        self.raw_weights = nn.Parameter(torch.ones(self.num_domains) * init_val)  # 初始为1
+        self.raw_weights = nn.Parameter(torch.zeros(self.num_domains))  # 初始为1
         # self.relu = torch.nn.ReLU()
-        self.eps = eps
+        # self.eps = eps  # Small value to avoid division by zero
 
     def forward(self, domain_strings, x):
         """
@@ -215,22 +193,19 @@ class InstanceTable(nn.Module):
                 同形状 (batch_size, 1) 的张量，每个元素等于原输入乘以对应的 domain 权重。
         """
         # positive_weights = self.raw_weights
-        w = torch.relu(self.raw_weights) + self.eps # (D,)
-        # normalize so sum(w)=D or sum(w)=1
-        w = w / w.sum() * self.num_domains  # (D,)
+        # w = self.relu(self.raw_weights) + self.eps # (D,)
+        positive_weights = self.raw_weights
 
         # map domains → weights
-        # idxes = [self.domain_to_idx[d] for d in domain_strings]
-        # idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
-        idxs = torch.tensor(
-            [self.domain_to_idx[d] for d in domain_strings],
-            device=x.device,
-            dtype=torch.long
-        )   # (B,)
+        idxes = [self.domain_to_idx[d] for d in domain_strings]
+        idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
 
-        domain_weights = w[idxs].unsqueeze(1)  # (B,1)
-        # domain_weights = domain_weights.view(-1, 1)
+        # Retrieve domain weights for each sample in the batch [batch_size].
+        domain_weights = positive_weights[idxes]
+        # Reshape weights to match input tensor dimensions [batch_size, 1].
+        domain_weights = domain_weights.view(-1, 1)
 
+        # Element-wise multiplication: each input value multiplied by its domain weight.
         out = x * domain_weights
         return out
 
