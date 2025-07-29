@@ -5,14 +5,14 @@ python3 main.py \
   --meta_json_file data/meta_aime.json \
   --weights_path outputs/qwen_math_prm_v0 \
   --batch_size 1 \
-  --gradient_accumulation 32 \
+  --gradient_accumulation 16 \
   --lr 1e-5 \
-  --iteration_num 3000 \
+  --iteration_num 1000 \
   --save_every_iterations 200 \
-  --scheduler_step_size 1000 \
-  --unroll_steps 3 \
+  --scheduler_step_size 2000 \
+  --unroll_steps 1 \
   --precision bf16 \
-  --scheduler_gamma 0.95 \
+  --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
   --max_epoch 10 \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
@@ -32,7 +32,7 @@ import torch.optim as optim
 from torch.optim import AdamW
 import wandb
 
-from peft import LoraConfig, get_peft_model, TaskType
+# from peft import LoraConfig, get_peft_model, TaskType
 
 from betty.engine import Engine
 from betty.problems import ImplicitProblem
@@ -55,7 +55,6 @@ parser.add_argument("--device", type=str, default="cuda")
 parser.add_argument("--precision", type=str, default="bf16")
 parser.add_argument("--strategy", type=str, default="default")
 parser.add_argument("--rollback", action="store_true")
-parser.add_argument("--baseline", action="store_true")
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--local_rank", type=int, default=0)
 parser.add_argument("--lr", type=float, default=5e-7)
@@ -86,39 +85,13 @@ set_seed(args.seed)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Prepare data
-domain_list = create_dataset_mapping(args.train_json_file, args.meta_json_file if not args.baseline else None)
+domain_list = create_dataset_mapping(args.train_json_file)
 domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
 # print("Domain to index mapping:", domain_to_idx)
-
-sampler = None
-resume_idxes = None
-resume_labels = None
-
-step_count = 0
-best_val_loss = float('inf')
 
 epoch_losses = []
 current_epoch = 0
 steps_per_epoch = 0
-
-(
-    train_dataloader,
-    meta_dataloader,
-) = build_dataloader(
-    processor_path = args.reward_model,
-    train_json_file = args.train_json_file,
-    meta_json_file=(None if args.baseline else args.meta_json_file),
-    train_batch_size= args.batch_size,
-    meta_batch_size= args.batch_size
-)
-
-# wandb init
-# os.environ["WANDB_MODE"] = "offline"
-wandb.init(
-    project="DreamPRM-v0",
-    name=f"{'baseline' if args.baseline else 'meta'}-bs{args.batch_size}-lr{args.lr}",
-    config=vars(args)
-)
 
 # Device
 device = torch.device(args.device)
@@ -129,14 +102,31 @@ criterion_meta = nn.MSELoss()
 
 # Globals
 step_count = 0
-best_val_loss = float('inf')
+best_loss = float('inf')
 
+# Track losses for validation
 lower_weighted_loss = []
 lower_loss = []
 upper_loss = []
-best_loss = float('inf')
-step_count = 0
-current_lr = args.lr
+
+(
+    train_dataloader,
+    meta_dataloader,
+) = build_dataloader(
+    processor_path = args.reward_model,
+    train_json_file = args.train_json_file,
+    meta_json_file = args.meta_json_file,
+    train_batch_size= args.batch_size,
+    meta_batch_size= args.batch_size
+)
+
+# wandb init
+wandb.init(
+    project="DreamPRM-v0",
+    name=f"meta-bs{args.batch_size}-lr{args.lr}",
+    config=vars(args)
+)
+
 
 # ---------------------------------
 # Upper Problem (Instance Reweighting)
@@ -147,34 +137,26 @@ class Upper(ImplicitProblem):
         return self.module(domain_strings, x)
 
     def training_step(self, batch):
-        # steps = [batch['1'], batch['2'], batch['3'], batch['4'], batch['5'],]
+        global step_count
         labels = batch['labels'].to(device)
         loss_tensor = torch.zeros_like(labels)
         
-        # Get dataset info from batch level (not per-step)
-        domains = batch['dataset']
-
         for k in sorted([k for k in batch if k.isdigit()], key=lambda x: int(x)):
-            # Access the lower problem through the dependency system
-            # Instead of searching through self.engine.problems, use self.lower
             step_scores = self.lower.module(
                 batch[k]['input_ids'].to(device),
                 batch[k]['attention_mask'].to(device)
             )
-            
-            # Convert scores to log-odds for aggregation
             step_scores = step_scores.clamp(1e-8, 1-1e-8)
             loss_tensor += torch.log(step_scores / (1 - step_scores))
 
-        # ① get a per‑example weight w_i ∈ ℝ  (or logit) from the table
-        #    NB: you already wrote the wrapper in forward()
-        #    pass *something* that identifies the group/domain plus the raw loss
-        weights = self.forward(batch['dataset'], step_scores.detach())   # [B]
+        # Compute mean score and apply sigmoid
+        outputs = torch.sigmoid(loss_tensor / len([k for k in batch if k.isdigit()]))
         
-        # ② apply the weights
-        loss = (weights * (step_scores - labels) ** 2).mean()            # weighted MSE
+        # Simple meta-learning loss (NO domain reweighting here)
+        loss = criterion_meta(outputs, labels)
+        wandb.log({'upper/loss': loss.item()})
         
-        return {'loss': loss}
+        return loss
 
     def configure_train_data_loader(self):
         return meta_dataloader
@@ -188,6 +170,7 @@ class Upper(ImplicitProblem):
             lr=1e-2,
             weight_decay=args.meta_weight_decay
         )
+
 
 # ---------------------------------
 # Lower Problem (PRM Fine-tuning)
@@ -234,7 +217,9 @@ class Lower(ImplicitProblem):
         # Compute loss
         loss = criterion(step_scores, labels)
         
+        # Track losses for logging
         self.epoch_losses.append(loss.item())
+        lower_loss.append(loss.item())
 
         # Epoch tracking
         if step_count % self.steps_per_epoch == 0:
@@ -247,46 +232,64 @@ class Lower(ImplicitProblem):
             print(f"\n[Epoch {self.current_epoch}] Average Loss: {avg_loss:.6f}")
 
             # ==== Save model each epoch ==============================================
+            # 1) Save the fine-tuned PRM model
             save_path = f"{args.weights_path}/qwen_math_prm/epoch_{self.current_epoch}"
             os.makedirs(save_path, exist_ok=True)
-
-            # 1) 保存下层 PRM（权重 + tokenizer）
             self.module.base_model.save_pretrained(save_path)
             self.module.tokenizer.save_pretrained(save_path)
 
-            # 2) 如果是 META 模式，再把上层 InstanceTable 也存一下
-            if not args.baseline and hasattr(self, 'upper'):
-                torch.save(f"{args.weights_path}/domain_weights.pt")
+            # 2) Save the upper problem's state dict
+            torch.save(
+                upper_problem.state_dict(),
+                os.path.join(args.weights_path, "instance_weights.pt")
+            )
             # =========================================================================
 
             self.epoch_losses.clear()
 
+        # Get current learning rate
         lr = self.scheduler.get_last_lr()[0] if hasattr(self, 'scheduler') else args.lr
 
-        if args.baseline:
-            # Baseline: simple fine-tuning
-            wandb.log({'train/loss': loss.item(), 'train/lr': lr}, step=step_count)
-            if step_count % 100 == 0:
-                print(f"Baseline Step {step_count}: loss={loss.item():.4f}, lr={lr:.2e}")
-            if hasattr(self, 'scheduler'):
-                self.scheduler.step()
-
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            return loss
-        
-        else:
-            # Meta-learning: instance reweighting
-            # Ensure losses tensor shape (batch_size, 1)
+        # Meta-learning: domain reweighting
+        # This is where domain reweighting happens - domains come from PRM800K data
+        if domains is not None:
+            # Ensure loss tensor has correct shape for InstanceTable
             loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss.unsqueeze(1)
+            # Apply domain reweighting through the upper problem
             weighted_loss = self.upper(domains, loss_tensor).squeeze()
-            
-            wandb.log({'train/weighted_loss': weighted_loss.item(), 'train/lr': lr}, step=step_count)
-            if step_count % 500 == 0:
-                print(f"Meta Step {step_count}: weighted_loss={weighted_loss.item():.4f}, lr={lr:.2e}")
-            if hasattr(self, 'scheduler'):
-                self.scheduler.step()
-            return weighted_loss
+        else:
+            # Fallback if no domain info
+            weighted_loss = loss
+        
+        # Track the weighted loss for validation
+        lower_weighted_loss.append(weighted_loss.item())
+        
+        # Log metrics
+        wandb.log({
+            'train/weighted_loss': weighted_loss.item(), 
+            'train/unweighted_loss': loss.item(),
+            'train/lr': lr
+        }, step=step_count)
+        
+        # Periodic logging
+        if step_count % 500 == 0:
+            print(f"Meta Step {step_count}: weighted_loss={weighted_loss.item():.4f}, unweighted_loss={loss.item():.4f}, lr={lr:.2e}")
+        
+        # Step scheduler
+        self.scheduler.step()
+        
+        # Log epoch-level metrics when epoch completes
+        if len(lower_loss) == len(train_dataloader):
+            mean_inner_loss = np.mean(lower_loss)
+            mean_inner_weighted_loss = np.mean(lower_weighted_loss)
+            wandb.log({
+                "inner_loss": mean_inner_loss,
+                "inner_weighted_loss": mean_inner_weighted_loss,
+            })
+            lower_loss.clear()
+            lower_weighted_loss.clear()
+        
+        return weighted_loss
 
     def configure_train_data_loader(self):
         return train_dataloader
@@ -319,46 +322,35 @@ class ReweightingEngine(Engine):
         print(f"[Validation at step {step_count}] Saving model...")
         torch.cuda.empty_cache()
 
-        if args.baseline:
-            # Baseline mode: only fine-tune the lower problem.
-            lower_problem = self.problems[0]
-            val_loss = np.mean(lower_loss) if lower_loss else best_loss
-            wandb.log({
-                "validation/loss": val_loss,
-                "validation/best_loss": best_loss,
-                "validation/step": step_count,
-                "validation/learning_rate": current_lr,
-            })
-            lower_loss.clear()
-
-            # save the fine-tuned PRM model.
-            lower_problem.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
-            lower_problem.module.tokenizer.save_pretrained(f"{args.weights_path}/qwen_math_prm")
-
-            print(f"Model saved. Val Loss: {val_loss:.4f}, Best: {best_loss:.4f}")
+        upper_problem = self.problems[0]
+        lower_problem = self.problems[1]
         
-        else:
-            # Non-baseline mode: save both upper and lower problems.
-            upper_problem = self.problems[0]
-            lower_problem = self.problems[1]
-            
-            # Save the fine-tuned PRM model.
-            lower_problem.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
-            lower_problem.module.tokenizer.save_pretrained(f"{args.weights_path}/qwen_math_prm")
+        # Save the fine-tuned PRM model.
+        lower_problem.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
+        lower_problem.module.tokenizer.save_pretrained(f"{args.weights_path}/qwen_math_prm")
 
-            # save the upper problem's state dict.
-            torch.save(
-                upper_problem.state_dict(),
-                f"{args.weights_path}/domain_weights.pt",
-            )
+        # save the upper problem's state dict.
+        torch.save(
+            upper_problem.state_dict(),
+            f"{args.weights_path}/domain_weights.pt",
+        )
 
-            wandb.log({
-                "validation/loss": best_loss,
-                "validation/step": step_count,
-            })
-            
-        # return {"loss": 1}
-        return {"loss": best_loss}
+        val_loss = float('inf')
+        if lower_weighted_loss:
+            val_loss = np.mean(lower_weighted_loss)
+        # update best
+        if val_loss < best_loss:
+            best_loss = val_loss
+        # clear for next round
+        lower_weighted_loss.clear()
+
+        # now log both current and best
+        wandb.log({
+            "validation/loss": val_loss,
+            "validation/best_loss": best_loss,
+        }, step=step_count)
+
+        return {"loss": val_loss}
     
 
 upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
@@ -378,21 +370,15 @@ engine_config = EngineConfig(
 )
 
 # Instantiate problems
-if args.baseline:
-    problems = [Lower(name='lower', config=lower_config)]
-    dependencies = {'l2u': {}, 'u2l': {}}
-    print("Running BASELINE mode")
-else:
-    upper_problem = Upper(name='upper', config=upper_config)
-    lower_problem = Lower(name='lower', config=lower_config)
-    problems = [upper_problem, lower_problem]
-    
-    # Define bidirectional dependencies properly
-    dependencies = {
-        'l2u': {lower_problem: [upper_problem]},  # Lower depends on Upper (since Lower calls self.upper)
-        'u2l': {upper_problem: [lower_problem]}   # Upper depends on Lower (bilevel structure)
-    }
-    print("Running META-LEARNING mode")
+upper_problem = Upper(name='upper', config=upper_config)
+lower_problem = Lower(name='lower', config=lower_config)
+problems = [upper_problem, lower_problem]
+
+# Define bidirectional dependencies properly
+dependencies = {
+    'l2u': {lower_problem: [upper_problem]},  # Lower depends on Upper (since Lower calls self.upper)
+    'u2l': {upper_problem: [lower_problem]}   # Upper depends on Lower (bilevel structure)
+}
 
 # Run
 # engine = ReweightingEngine(
@@ -405,14 +391,21 @@ engine.run()
 
 print("Training completed, saving models...")
 
+# Save the models after training
+upper_problem = problems[0]
+lower_problem = problems[1]
+
+# Save the lower problem's model and tokenizer
 save_path = f"{args.weights_path}/qwen_math_prm"
 os.makedirs(save_path, exist_ok=True)
 lower_problem.module.base_model.save_pretrained(save_path)
 lower_problem.module.tokenizer.save_pretrained(save_path)
 
-if not args.baseline:
-    # Save the upper problem's state dict
-    upper_problem.state_dict().save(f"{args.weights_path}/domain_weights.pt")
+# Save the upper problem's state dict
+torch.save(
+    upper_problem.state_dict(),
+    f"{args.weights_path}/domain_weights.pt"
+)
 
 wandb.finish()
 
