@@ -32,6 +32,7 @@ import torch.optim as optim
 from torch.optim import AdamW
 import wandb
 
+import deepspeed
 # from peft import LoraConfig, get_peft_model, TaskType
 
 from betty.engine import Engine
@@ -42,6 +43,17 @@ from model import *
 from data import *
 from utils import *
 
+# Set environment variables for DeepSpeed
+# import torch.distributed as dist
+
+# os.environ["LOCAL_RANK"] = "0"
+# if not dist.is_initialized():
+#     dist.init_process_group(
+#     backend="nccl",
+#     init_method="file:///tmp/deepspeed_init",
+#     rank=0,
+#     world_size=1
+# )
 
 parser = argparse.ArgumentParser(description="DreamPRM")
 parser.add_argument('--train_json_file', type=str)
@@ -78,11 +90,17 @@ parser.add_argument("--paint_interval", type=int, default=20)
 parser.add_argument("--peft_rank", type=int, default=-1, help="Rank for PEFT, -1 for no PEFT")
 parser.add_argument("--lora_alpha", type=float, default=32.0)
 parser.add_argument("--lora_dropout", type=float, default=0.05)
+parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed for training")
+parser.add_argument("--deepspeed_config", type=str, default="utils/ds_config.json", help="Path to DeepSpeed config file")
 
 args = parser.parse_args()
 set_seed(args.seed)
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Set environment variables for DeepSpeed
+if args.deepspeed:
+    os.environ["DEEPSPEED_CONFIG"] = args.deepspeed_config
+    # os.environ["LOCAL_RANK"] = str(args.local_rank)  # Set local rank for distributed training
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Prepare data
 domain_list = create_dataset_mapping(args.train_json_file)
@@ -183,7 +201,7 @@ class Lower(ImplicitProblem):
         self.steps_per_epoch = len(train_dataloader)  # total steps in one epoch
 
     def forward(self, input_ids, attention_mask):   #, pixel_values, image_grid_thw):
-        # torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         return self.module(input_ids, attention_mask)  #, pixel_values, image_grid_thw)
 
     def training_step(self, batch):
@@ -296,8 +314,6 @@ class Lower(ImplicitProblem):
         return train_dataloader
 
     def configure_module(self):
-        # return QwenVL_RM(device)
-        # return QwenMath_RM(device, args.reward_model).train()
         return QwenMath_RM(device, args).train()
 
     def configure_optimizer(self):
@@ -308,6 +324,8 @@ class Lower(ImplicitProblem):
         )
 
     def configure_scheduler(self):
+        # Use StepLR scheduler
+        self.optimizer = self.configure_optimizer()
         scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,
             step_size = args.scheduler_step_size,
