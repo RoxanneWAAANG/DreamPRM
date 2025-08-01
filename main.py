@@ -21,20 +21,14 @@ python3 main.py \
 
 import argparse
 import os
-import gc
 import numpy as np
-import pandas as pd
-from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# from transformers import AdamW
 from torch.optim import AdamW
 import wandb
 
-import deepspeed
-# from peft import LoraConfig, get_peft_model, TaskType
-
+from peft import LoraConfig, get_peft_model, TaskType
 from betty.engine import Engine
 from betty.problems import ImplicitProblem
 from betty.configs import Config, EngineConfig
@@ -43,17 +37,6 @@ from model import *
 from data import *
 from utils import *
 
-# Set environment variables for DeepSpeed
-# import torch.distributed as dist
-
-# os.environ["LOCAL_RANK"] = "0"
-# if not dist.is_initialized():
-#     dist.init_process_group(
-#     backend="nccl",
-#     init_method="file:///tmp/deepspeed_init",
-#     rank=0,
-#     world_size=1
-# )
 
 parser = argparse.ArgumentParser(description="DreamPRM")
 parser.add_argument('--train_json_file', type=str)
@@ -90,53 +73,32 @@ parser.add_argument("--paint_interval", type=int, default=20)
 parser.add_argument("--peft_rank", type=int, default=-1, help="Rank for PEFT, -1 for no PEFT")
 parser.add_argument("--lora_alpha", type=float, default=32.0)
 parser.add_argument("--lora_dropout", type=float, default=0.05)
-parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed for training")
-parser.add_argument("--deepspeed_config", type=str, default="utils/ds_config.json", help="Path to DeepSpeed config file")
 
 args = parser.parse_args()
 set_seed(args.seed)
 
-# Set environment variables for DeepSpeed
-if args.deepspeed:
-    os.environ["DEEPSPEED_CONFIG"] = args.deepspeed_config
-    # os.environ["LOCAL_RANK"] = str(args.local_rank)  # Set local rank for distributed training
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Prepare data
-domain_list = create_dataset_mapping(args.train_json_file)
-domain_to_idx = {domain: idx for idx, domain in enumerate(domain_list)}
-# print("Domain to index mapping:", domain_to_idx)
-
-epoch_losses = []
-current_epoch = 0
-steps_per_epoch = 0
-
-# Device
+# === Data, Domains, Device ===
+instance_list = create_dataset_mapping(args.train_json_file)
 device = torch.device(args.device)
 
+# Dataloaders
+train_dataloader, meta_dataloader = build_dataloader(
+    processor_path=args.reward_model,
+    train_json_file=args.train_json_file,
+    meta_json_file=args.meta_json_file,
+    train_batch_size=args.batch_size,
+    meta_batch_size=args.batch_size
+)
+
 # Loss
-criterion = nn.MSELoss()
+criterion = nn.MSELoss(reduction="none")
 criterion_meta = nn.MSELoss()
 
-# Globals
-step_count = 0
+# Tracking
+lower_weighted_loss, lower_loss, upper_loss = [], [], []
 best_loss = float('inf')
-
-# Track losses for validation
-lower_weighted_loss = []
-lower_loss = []
-upper_loss = []
-
-(
-    train_dataloader,
-    meta_dataloader,
-) = build_dataloader(
-    processor_path = args.reward_model,
-    train_json_file = args.train_json_file,
-    meta_json_file = args.meta_json_file,
-    train_batch_size= args.batch_size,
-    meta_batch_size= args.batch_size
-)
 
 # wandb init
 wandb.init(
@@ -145,53 +107,67 @@ wandb.init(
     config=vars(args)
 )
 
+# === Globals ===
+step_count = 0
 
 # ---------------------------------
 # Upper Problem (Instance Reweighting)
 # ---------------------------------
 class Upper(ImplicitProblem):
-    def forward(self, domain_strings, x):
+    def forward(self, instance_strings, x):
         # torch.cuda.empty_cache()
-        return self.module(domain_strings, x)
+        return self.module(instance_strings, x)
+
+    def parameters(self):
+        """
+        Yield only the trainable (i.e., LoRA) parameters.
+        """
+        # return self.module.parameters()
+        return (p for p in self.module.parameters() if p.requires_grad)
 
     def training_step(self, batch):
-        global step_count
+        # steps = [batch['1'], batch['2'], batch['3'], batch['4'], batch['5'],]
+        numeric_keys = [k for k in batch.keys() if k.isdigit()]
+        sorted_keys = sorted(numeric_keys, key=lambda x: int(x))
+        steps = [batch[key] for key in sorted_keys]
         labels = batch['labels'].to(device)
-        loss_tensor = torch.zeros_like(labels)
-        
-        for k in sorted([k for k in batch if k.isdigit()], key=lambda x: int(x)):
-            step_scores = self.lower.module(
-                batch[k]['input_ids'].to(device),
-                batch[k]['attention_mask'].to(device)
-            )
-            step_scores = step_scores.clamp(1e-8, 1-1e-8)
-            loss_tensor += torch.log(step_scores / (1 - step_scores))
 
-        # Compute mean score and apply sigmoid
-        outputs = torch.sigmoid(loss_tensor / len([k for k in batch if k.isdigit()]))
-        
-        # Simple meta-learning loss (NO domain reweighting here)
+        mean_score = 0
+        for i in steps:
+            score = self.lower(
+                i['input_ids'].to(device),
+                i['attention_mask'].to(device),
+            )
+            mean_score += torch.log(score / (1 - score))
+            
+        outputs = torch.sigmoid(mean_score / len(steps))
         loss = criterion_meta(outputs, labels)
-        wandb.log({'upper/loss': loss.item()})
-        
-        return loss
+        upper_loss.append(loss.item())
+
+        # torch.cuda.empty_cache()
+        if len(upper_loss) == len(meta_dataloader):
+            mean_outer_loss = np.mean(upper_loss)
+            wandb.log({"outer_loss": mean_outer_loss})
+            upper_loss.clear()
+
+        return {"loss": loss}
 
     def configure_train_data_loader(self):
         return meta_dataloader
 
     def configure_module(self):
-        return InstanceTable(domain_to_idx)
+        return InstanceTable(instance_list)
 
     def configure_optimizer(self):
         return AdamW(
             self.module.parameters(),
-            lr=1e-2,
+            lr=args.meta_lr,
             weight_decay=args.meta_weight_decay
         )
 
 
 # ---------------------------------
-# Lower Problem (PRM Fine-tuning)
+# Lower Problem: PRM Fine-tuning + LoRA
 # ---------------------------------
 class Lower(ImplicitProblem):
     def __init__(self, name, config):
@@ -201,131 +177,70 @@ class Lower(ImplicitProblem):
         self.steps_per_epoch = len(train_dataloader)  # total steps in one epoch
 
     def forward(self, input_ids, attention_mask):   #, pixel_values, image_grid_thw):
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         return self.module(input_ids, attention_mask)  #, pixel_values, image_grid_thw)
+
+    def parameters(self):
+        return (p for p in self.module.parameters() if p.requires_grad)
 
     def training_step(self, batch):
         global step_count
         step_count += 1
 
-        # Inputs
-        ids    = batch['input_ids'].to(device)
-        mask   = batch['attention_mask'].to(device)
+        # ---- 1) forward pass ----
+        ids   = batch['input_ids'].to(device)
+        mask  = batch['attention_mask'].to(device)
         labels = batch['label'].float().to(device)
-        domains = batch.get('dataset', None)
 
-        # Forward pass - now returns step-level scores
-        step_scores = self.forward(ids, mask)  # [B] - mean score per sequence
-        torch.cuda.empty_cache()
+        step_scores = self.forward(
+            input_ids=ids, 
+            attention_mask=mask
+        )
 
-        # Handle labels properly - extract overall correctness
-        if labels.dim() > 1:
-            # If labels is [B, T], extract the overall correctness
-            label_mask = (labels != -100).float()
-            overall_labels = []
-            for i in range(labels.size(0)):
-                valid_positions = label_mask[i].nonzero(as_tuple=True)[0]
-                if len(valid_positions) > 0:
-                    # Take the last valid label (overall problem correctness)
-                    last_pos = valid_positions[-1]
-                    overall_labels.append(labels[i, last_pos])
-                else:
-                    overall_labels.append(0.5)  # Default neutral score
-            labels = torch.stack(overall_labels)  # [B]
-        
-        # Compute loss
         loss = criterion(step_scores, labels)
-        del step_scores
-        torch.cuda.empty_cache()
-        
-        # Track losses for logging
-        self.epoch_losses.append(loss.item())
+
+        # ---- 2) meta-reweight via upper ----
+        # shape it for InstanceTable: [1,1,B] or similar
+        # weighted_loss = self.upper.forward(batch['dataset'], lt).squeeze()
+        weighted_loss = self.upper( # [B,1] → squeeze→[B]
+            batch['dataset'],
+            loss    # [B,1]
+        )
         lower_loss.append(loss.item())
-
-        # Epoch tracking
-        if step_count % self.steps_per_epoch == 0:
-            avg_loss = np.mean(self.epoch_losses)
-            self.current_epoch += 1
-            wandb.log({
-                'epoch/avg_loss': avg_loss,
-                'epoch/number': self.current_epoch
-            }, step=step_count)
-            print(f"\n[Epoch {self.current_epoch}] Average Loss: {avg_loss:.6f}")
-
-            # ==== Save model each epoch ==============================================
-            # 1) Save the fine-tuned PRM model
-            save_path = f"{args.weights_path}/qwen_math_prm/epoch_{self.current_epoch}"
-            os.makedirs(save_path, exist_ok=True)
-            self.module.base_model.save_pretrained(save_path)
-            self.module.tokenizer.save_pretrained(save_path)
-
-            # 2) Save the upper problem's state dict
-            torch.save(
-                upper_problem.state_dict(),
-                os.path.join(args.weights_path, "instance_weights.pt")
-            )
-            # =========================================================================
-
-            self.epoch_losses.clear()
-
-        # Get current learning rate
-        lr = self.scheduler.get_last_lr()[0] if hasattr(self, 'scheduler') else args.lr
-
-        # Meta-learning: domain reweighting
-        # This is where domain reweighting happens - domains come from PRM800K data
-        # Ensure loss tensor has correct shape for InstanceTable
-        loss_tensor = loss.unsqueeze(0) if loss.dim() == 0 else loss.unsqueeze(1)
-        # Apply domain reweighting through the upper problem
-        weighted_loss = self.upper(domains, loss_tensor).squeeze()
-        
-        # Track the weighted loss for validation
         lower_weighted_loss.append(weighted_loss.item())
-        
-        # Log metrics
-        wandb.log({
-            'train/weighted_loss': weighted_loss.item(), 
-            'train/unweighted_loss': loss.item(),
-            'train/lr': lr
-        }, step=step_count)
-        
-        # Periodic logging
-        if step_count % 500 == 0:
-            print(f"Meta Step {step_count}: weighted_loss={weighted_loss.item():.4f}, unweighted_loss={loss.item():.4f}, lr={lr:.2e}")
-        
-        # Step scheduler
-        self.scheduler.step()
-        
-        # Log epoch-level metrics when epoch completes
-        if len(lower_loss) == len(train_dataloader):
+
+        # 4) logging
+        if len(lower_loss) == 100:
             mean_inner_loss = np.mean(lower_loss)
             mean_inner_weighted_loss = np.mean(lower_weighted_loss)
-            wandb.log({
-                "inner_loss": mean_inner_loss,
-                "inner_weighted_loss": mean_inner_weighted_loss,
-            })
+            wandb.log(
+                {
+                    "inner_loss": np.mean(lower_loss),
+                    "inner_weighted_loss": np.mean(lower_weighted_loss)
+                }
+            )
             lower_loss.clear()
             lower_weighted_loss.clear()
-        
-        del loss_tensor
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
+
         return weighted_loss
 
     def configure_train_data_loader(self):
         return train_dataloader
 
     def configure_module(self):
-        return QwenMath_RM(device, args).train()
+        # return QwenMath_RM(device, args).base_model.train()
+        return QwenMath_RM(device, args)
 
     def configure_optimizer(self):
-        return torch.optim.Adam(
+        optimizer = optim.AdamW(
             self.module.parameters(),
             lr=args.lr,
-            weight_decay=args.weight_decay
+            weight_decay=args.weight_decay,
         )
+        return optimizer
 
     def configure_scheduler(self):
-        # Use StepLR scheduler
-        self.optimizer = self.configure_optimizer()
         scheduler = optim.lr_scheduler.StepLR(
             self.optimizer,
             step_size = args.scheduler_step_size,
@@ -334,50 +249,20 @@ class Lower(ImplicitProblem):
         return scheduler
 
 
-class ReweightingEngine(Engine):
-    @torch.no_grad()
-    def validation(self):
-        global best_loss, step_count
-        print(f"[Validation at step {step_count}] Saving model...")
-        torch.cuda.empty_cache()
-
-        upper_problem = self.problems[0]
-        lower_problem = self.problems[1]
-        
-        # Save the fine-tuned PRM model.
-        lower_problem.module.base_model.save_pretrained(f"{args.weights_path}/qwen_math_prm")
-        lower_problem.module.tokenizer.save_pretrained(f"{args.weights_path}/qwen_math_prm")
-
-        # save the upper problem's state dict.
-        torch.save(
-            upper_problem.state_dict(),
-            f"{args.weights_path}/domain_weights.pt",
-        )
-
-        val_loss = float('inf')
-        if lower_weighted_loss:
-            val_loss = np.mean(lower_weighted_loss)
-        # update best
-        if val_loss < best_loss:
-            best_loss = val_loss
-        # clear for next round
-        lower_weighted_loss.clear()
-
-        # now log both current and best
-        wandb.log({
-            "validation/loss": val_loss,
-            "validation/best_loss": best_loss,
-        }, step=step_count)
-
-        return {"loss": val_loss}
-    
-
-upper_config = Config(type="darts", precision=args.precision, retain_graph=True)
+upper_config = Config(
+    type="darts", 
+    precision=args.precision, 
+    # retain_graph=True, 
+    retain_graph=False,
+    gradient_clipping=1.0, 
+    gradient_accumulation=args.gradient_accumulation,
+)
 lower_config = Config(
     type="darts", 
     precision=args.precision, 
-    unroll_steps=args.unroll_steps,
-    gradient_accumulation=args.gradient_accumulation
+    unroll_steps=args.unroll_steps, 
+    gradient_accumulation=args.gradient_accumulation,
+    gradient_clipping=1.0
 )
 
 engine_config = EngineConfig(
@@ -389,14 +274,14 @@ engine_config = EngineConfig(
 )
 
 # Instantiate problems
-upper_problem = Upper(name='upper', config=upper_config)
-lower_problem = Lower(name='lower', config=lower_config)
-problems = [upper_problem, lower_problem]
+upper = Upper(name="upper", config=upper_config)
+lower = Lower(name="lower", config=lower_config)
+problems = [upper, lower]
 
-# Define bidirectional dependencies properly
+# Define bidirectional dependencies
 dependencies = {
-    'l2u': {lower_problem: [upper_problem]},  # Lower depends on Upper (since Lower calls self.upper)
-    'u2l': {upper_problem: [lower_problem]}   # Upper depends on Lower (bilevel structure)
+    "l2u": {lower: [upper]},    # Lower depends on Upper (since Lower calls self.upper)
+    "u2l": {upper: [lower]} # Upper depends on Lower (bilevel structure)
 }
 
 # Run
@@ -406,13 +291,9 @@ engine = Engine(
     problems=problems,
     dependencies=dependencies
 )
+
 engine.run()
-
 print("Training completed, saving models...")
-
-# Save the models after training
-upper_problem = problems[0]
-lower_problem = problems[1]
 
 # Save the lower problem's model and tokenizer
 save_path = f"{args.weights_path}/qwen_math_prm"
