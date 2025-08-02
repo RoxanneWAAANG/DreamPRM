@@ -5,7 +5,7 @@ python3 main.py \
   --meta_json_file data/meta_aime.json \
   --weights_path outputs/qwen_math_prm_v0 \
   --batch_size 1 \
-  --gradient_accumulation 32 \
+  --gradient_accumulation 8 \
   --lr 1e-5 \
   --iteration_num 1000 \
   --save_every_iterations 200 \
@@ -138,7 +138,8 @@ class Upper(ImplicitProblem):
                 i['input_ids'].to(device),
                 i['attention_mask'].to(device),
             )
-            mean_score += torch.log(score / (1 - score))
+            # mean_score += torch.log(score / (1 - score))
+            mean_score += score
             
         outputs = torch.sigmoid(mean_score / len(steps))
         loss = criterion_meta(outputs, labels)
