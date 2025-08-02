@@ -7,6 +7,8 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
 from qwen_vl_utils import process_vision_info
 
+from tqdm import tqdm
+
 
 def split_step(s_id, response):
     s = f"Step {s_id}"
@@ -71,289 +73,108 @@ def resize_image_if_needed(img, max_size=512):
         img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
     return img
 
-class MyDataset_QwenVL(Dataset):
-    def __init__(self, data_js, processor):
-        self.data_js = data_js
-        self.processor = processor
+class MyMetaDataset_QwenMath(Dataset):
+    """
+    Multi-step meta-learning examples. The `input` field contains all steps
+    joined by <extra_0>. We split and re-wrap each step individually.
+    Pre-processes all data during initialization for efficiency.
+    """
+    def __init__(self, records, tokenizer):
+        self.data_js = []
+        self.tokenizer = tokenizer
+        
+        pbar = tqdm(records, desc="Processing meta data")
+        for record in pbar:
+            input_text = record['input']
+            label = float(record['true_false'])
+            
+            # Get dataset identifier
+            dataset = record.get('id', str(len(self.data_js)))
+            
+            # Split into steps by separator
+            raw_steps = input_text.split("\n\n<extra_0>")
+            steps = [s.strip() for s in raw_steps if s.strip()]
+            
+            r_dict = {}
+            for step_idx, step in enumerate(steps, start=1):
+                messages = [
+                    {"role": "user", "content": step}
+                ]
+                text = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                inputs = self.tokenizer(
+                    text,  # String format, not list
+                    return_tensors="pt"
+                    # Remove .to("cuda") - let DataLoader handle device movement
+                )
+                r_dict[str(step_idx)] = {
+                    'input_ids': inputs['input_ids'].squeeze(),
+                    'attention_mask': inputs['attention_mask'].squeeze()
+                }
+            
+            r_dict['labels'] = torch.tensor(label, dtype=torch.float32)
+            r_dict['dataset'] = dataset
+            self.data_js.append(r_dict)
 
     def __len__(self):
         return len(self.data_js)
 
     def __getitem__(self, idx):
-        # find question and prompt
-        i = self.data_js[idx]['id']
-        prompt = self.data_js[idx]['input']
-        add = self.data_js[idx]['add']
-        image_path = self.data_js[idx]['image_path']
-        prompt = prompt + "\n\n" + add
-        label = self.data_js[idx]['accuracy']
-        dset = self.data_js[idx]['dataset']
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": image_path,
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        image_inputs = [resize_image_if_needed(image_inputs[0])]
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to("cuda")
-
-        return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'pixel_values': inputs['pixel_values'].squeeze(),
-            'image_grid_thw': inputs['image_grid_thw'].squeeze(),
-            'label': label,
-            'dataset': dset
-        }
-
-
-class MyDataset_Llava(Dataset):
-    def __init__(self, data_js, processor):
-        self.data_js = data_js
-        self.processor = processor
-
-    def __len__(self):
-        return len(self.data_js)
-
-    def __getitem__(self, idx):
-        # find question and prompt
-        i = self.data_js[idx]['id']
-        prompt = self.data_js[idx]['input']
-        add = self.data_js[idx]['add']
-        image_path = self.data_js[idx]['image_path']
-        prompt = prompt + "\n\n" + add
-        label = self.data_js[idx]['accuracy']
-        dset = self.data_js[idx]['dataset']
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image"},
-                ],
-            }
-        ]
-        text = self.processor.apply_chat_template(
-            messages, add_generation_prompt=True
-        )
-        raw_image = Image.open(image_path)
-        inputs = self.processor(images=raw_image, text=text, return_tensors='pt').to(0, torch.bfloat16)
-
-        return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'pixel_values': inputs['pixel_values'].squeeze(),
-            'image_sizes': inputs['image_sizes'].squeeze(),
-            'label': label,
-            'dataset': dset
-        }
+        return self.data_js[idx]
 
 
 class MyDataset_QwenMath(Dataset):
     """
     Single-step PRM training examples for QwenMath.
     Each sample provides one <extra_0> reasoning step.
+    Pre-processes all data during initialization for efficiency.
     """
     def __init__(self, records, tokenizer):
-        self.records = records
+        self.data_js = []
         self.tokenizer = tokenizer
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, idx):
-        item = self.records[idx]
-        prompt = item['input']
-        add = item['add']
-        label = float(item.get('accuracy', item.get('score', 0)))
-        # Use the actual dataset field (which contains problem id) for instance reweighting
-        dataset = item.get('dataset', str(item.get('id', idx)))
-
-        messages = [
-            {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": add}
-        ]
         
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False
-        )
+        pbar = tqdm(records, desc="Processing train data")
+        for item in pbar:
+            prompt = item['input']
+            add = item['add']
+            label = float(item.get('accuracy', item.get('score', 0)))
+            # Use the actual dataset field (which contains problem id) for instance reweighting
+            dataset = item.get('dataset', str(item.get('id', len(self.data_js))))
 
-        inputs = self.tokenizer(
-            text=[text],
-            return_tensors="pt",
-            add_special_tokens=False
-        )
-        
-        return {
-            'input_ids':     inputs['input_ids'].squeeze(0),
-            'attention_mask':inputs['attention_mask'].squeeze(0),
-            'label':         torch.tensor(label, dtype=torch.float),
-            'dataset':       dataset
-        }
-    
-
-class MyMetaDataset_QwenVL(Dataset):
-    def __init__(self, data_js, processor):
-        self.data_js = data_js
-        self.processor = processor
-
-    def __len__(self):
-        return len(self.data_js)
-
-    def __getitem__(self, idx):
-        # find question and prompt
-        input = self.data_js[idx]['input']
-        image_path = self.data_js[idx]['image_path']
-        label = self.data_js[idx]['true_false']
-
-        r_dict = {}
-        step_num = find_max_step(input)
-        for index in range(step_num):
-            step = split_step(index+1, input)
             messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "image": image_path,
-                        },
-                        {"type": "text", "text": step},
-                    ],
-                }
+                {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": add}
             ]
-            image_inputs, video_inputs = process_vision_info(messages)
-            image_inputs = [resize_image_if_needed(image_inputs[0])]
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
-            inputs = inputs.to("cuda")
-            r_dict[f"{index+1}"] = {
-                'input_ids': inputs['input_ids'].squeeze(),
-                'attention_mask': inputs['attention_mask'].squeeze(),
-                'pixel_values': inputs['pixel_values'].squeeze(),
-                'image_grid_thw': inputs['image_grid_thw'].squeeze(),
-            }
-        r_dict["labels"] = torch.tensor(label).to(dtype=torch.float)
-        return r_dict
-
-
-class MyMetaDataset_Llava(Dataset):
-    def __init__(self, data_js, processor, step_num = 5):
-        self.data_js = data_js
-        self.processor = processor
-        self.step_num = step_num
-
-    def __len__(self):
-        return len(self.data_js)
-
-    def __getitem__(self, idx):
-        # find question and prompt
-        input = self.data_js[idx]['input']
-        image_path = self.data_js[idx]['image_path']
-        label = self.data_js[idx]['true_false']
-        r_dict = {}
-        for index in range(self.step_num):
-            step = split_step(index+1, input)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": step},
-                        {"type": "image"},
-                    ],
-                }
-            ]
-            text = self.processor.apply_chat_template(
-                messages, add_generation_prompt=True
-            )
-            raw_image = Image.open(image_path)
-            inputs = self.processor(images=raw_image, text=text, return_tensors='pt').to(0, torch.bfloat16)
-            r_dict[f"{index+1}"] = {
-                'input_ids': inputs['input_ids'].squeeze(),
-                'attention_mask': inputs['attention_mask'].squeeze(),
-                'pixel_values': inputs['pixel_values'].squeeze(),
-                'image_sizes': inputs['image_sizes'].squeeze(),
-            }
-        r_dict["labels"] = torch.tensor(label).to(dtype=torch.float)
-        return r_dict
-
-
-class MyMetaDataset_QwenMath(Dataset):
-    """
-    Multi-step meta-learning examples. The `input` field contains all steps
-    joined by <extra_0>. We split and re-wrap each step individually.
-    """
-    def __init__(self, records, tokenizer):
-        self.records = records
-        self.tokenizer = tokenizer
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, idx):
-        record = self.records[idx]
-        input_text = record['input']
-        label = float(record['true_false'])
-
-        # Get dataset identifier
-        dataset = record.get('id', str(idx))
-
-        # Split into steps by separator
-        raw_steps = input_text.split("\n\n<extra_0>")
-        steps = [s.strip() for s in raw_steps if s.strip()]
-
-        r_dict = {}
-        for i, step in enumerate(steps, start=1):
-            messages = [
-                {"role": "user", "content": step}
-            ]
+            
             text = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
-                add_generation_prompt=True
+                add_generation_prompt=False
             )
+
             inputs = self.tokenizer(
-                text=[text],
-                padding=True,
+                text,  # String format, not list
                 return_tensors="pt"
-            ).to("cuda")
-            r_dict[str(i)] = {
-                'input_ids': inputs['input_ids'].squeeze(0),
-                'attention_mask': inputs['attention_mask'].squeeze(0)
-            }
-        r_dict['labels'] = torch.tensor(label, dtype=torch.float)
-        r_dict['dataset'] = dataset
-        return r_dict
+                # Remove add_special_tokens=False to match collaborator
+                # Remove .to("cuda") - let DataLoader handle device movement
+            )
+            
+            self.data_js.append({
+                'input_ids': inputs['input_ids'].squeeze(),
+                'attention_mask': inputs['attention_mask'].squeeze(),
+                'label': torch.tensor(label, dtype=torch.float32),
+                'dataset': dataset
+            })
+
+    def __len__(self):
+        return len(self.data_js)
+
+    def __getitem__(self, idx):
+        return self.data_js[idx]
 
 
 def custom_collate_fn(batch):
