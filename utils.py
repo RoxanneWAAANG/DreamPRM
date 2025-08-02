@@ -1,4 +1,4 @@
-from model import QwenVL_RM, QwenMath_RM
+from model import QwenMath_RM
 import random
 import numpy as np
 import torch
@@ -116,44 +116,6 @@ def generate_reward_model_input_math(input, response_step, processor):
     )
     inputs = inputs.to("cuda")
     return inputs
-
-
-# def create_dataset_mapping(json_file_path):
-#     """
-#     从JSON文件中提取所有唯一的dataset名称，并创建一个从0开始递增的数字映射字典
-#     支持视觉数据集和数学数据集两种格式
-
-#     参数:
-#     json_file_path: JSON文件路径
-
-#     返回:
-#     一个字典，格式为 {dataset_name1: 0, dataset_name2: 1, ...}
-#     """
-#     # 读取JSON文件
-#     with open(json_file_path, 'r', encoding='utf-8') as f:
-#         data = json.load(f)
-
-#     # 检查数据集类型并提取唯一标识符
-#     unique_identifiers = set()
-    
-#     # 检查是否为数学数据集（没有image_path但有id字段）
-#     if data and "image_path" not in data[0] and "id" in data[0]:
-#         # 数学数据集：使用problem_id作为域标识
-#         for item in data:
-#             if "id" in item:
-#                 unique_identifiers.add(f"problem_{item['id']}")
-#     else:
-#         # 视觉数据集：使用dataset字段
-#         for item in data:
-#             if "dataset" in item:
-#                 unique_identifiers.add(item["dataset"])
-
-#     # 创建映射字典（按字母排序）
-#     sorted_identifiers = sorted(list(unique_identifiers))
-#     mapping = {identifier: idx for idx, identifier in enumerate(sorted_identifiers)}
-#     print(f"Created dataset mapping: {mapping}")
-
-#     return mapping
 
 
 def create_dataset_mapping(json_file_path):
