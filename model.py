@@ -13,70 +13,6 @@ if not hasattr(nn, "RMSNorm"):
     from transformers.models.llama.modeling_llama import LlamaRMSNorm as RMSNorm
     nn.RMSNorm = RMSNorm
 
-# # Define LoRA configuration
-# lora_config = LoraConfig(
-#     r=8,             # Rank for dimensionality reduction (higher = better performance but more compute)
-#     lora_alpha=16,   # Scaling factor for LoRA weights
-#     target_modules=["q_proj", "v_proj"],  # Modules to apply LoRA to (GPT example)
-#     lora_dropout=0.1,  # Dropout probability for LoRA layers
-#     bias="none"      # Whether to apply LoRA to biases ("none", "all", or "lora_only")
-# )
-
-class QwenVL_RM(nn.Module):
-    def __init__(self, device, model_path="Qwen/Qwen2-VL-2B-Instruct"):
-        super(QwenVL_RM, self).__init__()
-        self.base_model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map=device,
-        )
-        # self.lora_model = get_peft_model(base_model, lora_config)
-        # Linear layer mapping from vocabulary size to single scalar reward.
-        self.LN = nn.Linear(self.base_model.config.vocab_size, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, input_ids, attention_mask, pixel_values, image_grid_thw):
-        # Passes multimodal inputs through the base Qwen2-VL model to get logits.
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask,
-                                  pixel_values = pixel_values, image_grid_thw = image_grid_thw)
-        # Passes multimodal inputs through the base Qwen2-VL model to get logits.
-        # [:, -1, :]: Takes logits of the final token position.
-        outputs = outputs.logits[:, -1, :].to(dtype=torch.float)
-        # print(outputs)
-        # Maps logits to scalar reward using linear layer.
-        value_outputs = self.LN(outputs)
-        # Applies sigmoid to get probability in [0,1] range.
-        value_outputs = self.sigmoid(value_outputs)
-        # print(value_outputs)
-        # Removes dimension to return shape [batch_size] instead of [batch_size, 1].
-        return value_outputs.squeeze(dim=1)
-
-
-class Llava_RM(nn.Module):
-    def __init__(self, device):
-        super(Llava_RM, self).__init__()
-        self.base_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-    "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            use_flash_attention_2=True
-        ).to(0)
-        # self.lora_model = get_peft_model(base_model, lora_config)
-        self.LN = nn.Linear(self.base_model.vocab_size, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, input_ids, attention_mask, pixel_values, image_sizes):
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask,
-                                  pixel_values = pixel_values, image_sizes = image_sizes)
-        outputs = outputs.logits[:, -1, :].to(dtype=torch.float)
-        # print(outputs)
-        value_outputs = self.LN(outputs)
-        value_outputs = self.sigmoid(value_outputs)
-        # print(value_outputs)
-        return value_outputs.squeeze(dim=1)
-
-
 class QwenMath_RM(nn.Module):
     def __init__(self, device, args):
         super().__init__()
@@ -86,10 +22,10 @@ class QwenMath_RM(nn.Module):
         # self.base_model = AutoModelForCausalLM.from_pretrained(
         self.base_model = AutoModel.from_pretrained(
             args.reward_model, 
-            device_map=device, 
+            # device_map=device, 
             torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
+            # trust_remote_code=True,
+            # low_cpu_mem_usage=True,
         )
 
         # ----- LoRA: Only wrap if peft_rank > 0 -----
@@ -113,9 +49,7 @@ class QwenMath_RM(nn.Module):
         self.LN = nn.Linear(
             self.base_model.config.hidden_size, 
             1, 
-            device=device, 
             dtype=torch.bfloat16,
-            bias=True
         )
 
         self.softmax = nn.Softmax(dim=-1)
@@ -134,8 +68,8 @@ class QwenMath_RM(nn.Module):
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False
+            # output_hidden_states=True,
+            # use_cache=False
         )
         
         # Apply classification head
@@ -155,9 +89,13 @@ class InstanceTable(nn.Module):
         self.instance_to_idx = instance_to_idx
         self.num_instance = len(instance_to_idx)
 
+        # self.raw_weights = nn.Parameter(
+        #     torch.zeros(self.num_instance)
+        # )  # 初始为1
         self.raw_weights = nn.Parameter(
-            torch.zeros(self.num_instance)
-        )  # 初始为1
+            torch.ones(self.num_instance, dtype=torch.float32)
+        )
+
         # self.relu = torch.nn.ReLU()
         # self.eps = eps  # Small value to avoid division by zero
 
@@ -178,7 +116,7 @@ class InstanceTable(nn.Module):
         positive_weights = torch.nn.functional.softplus(self.raw_weights)
 
         # Normalize weights by their mean to maintain scale
-        normalized_weights = positive_weights / positive_weights.mean()    
+        normalized_weights = positive_weights / positive_weights.mean() + 1e-8
 
         idxes = [self.instance_to_idx[d] for d in instance_strings]
         idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
