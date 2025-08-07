@@ -11,6 +11,12 @@ from tqdm import tqdm
 
 
 def split_step(s_id, response):
+    """    
+    Split the response string to extract the assistant's response for a specific step.
+    Args:
+        s_id: Step number to extract.
+        response: Full response string containing multiple steps.
+    """
     s = f"Step {s_id}"
     s_next = f"Step {s_id+1}"
     if s_next in response:
@@ -121,50 +127,52 @@ class MyMetaDataset_QwenMath(Dataset):
         input_text = record['input']
         label = float(record['true_false'])
         dataset = record.get('id', str(idx))
-        
-        # Extract question
-        if "Step 1" in input_text:
-            question = input_text.split("Step 1")[0].strip()
-            question = question.replace("Question: ", "").strip()
-        else:
-            question = input_text.strip()
+        print(f"Processing dataset: {dataset}")
         
         # Find max step
         step_num = find_max_step(input_text)
-        
-        # For simplicity, just return one random step (you can modify this)
-        import random
-        step_idx = random.randint(1, max(1, step_num))
-        
-        # Get cumulative content up to this step
-        step_content = question + "\n\n"
-        for i in range(1, step_idx + 1):
-            step = split_step(i, input_text)
-            step_content += step + "\n\n"
-        step_content = step_content.strip()
-        
-        messages = [
-            {"role": "user", "content": step_content}
-        ]
-        
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-        )
+        print(f"Max step number found: {step_num}")
 
-        return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'label': torch.tensor(label, dtype=torch.float32),
-            'dataset': dataset
-        }
+        # Create a dictionary to hold the cumulative content
+        r_dict = {}
+        
+        for index in range(step_num):
+            step = split_step(index+1, input_text)
+            # print(f"Processing step {index+1}: {step.strip()}")
+
+            messages = [
+                {
+                    "role": "user", 
+                    "content": f"{step.strip()}\n\n"
+                }
+            ]
+
+            # Apply chat template
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+
+            # Tokenize the text
+            inputs = self.tokenizer(
+                [text],
+                return_tensors="pt",
+                padding=True,
+            )
+
+            # Store the inputs in the dictionary
+            r_dict[f"{index+1}"] = {
+                'input_ids': inputs['input_ids'].squeeze(),
+                'attention_mask': inputs['attention_mask'].squeeze(),
+            }
+            # print(f"Processed step {index+1}: {r_dict[f'{index+1}']['input_ids']}")
+            # print(r_dict.keys())
+        
+        r_dict["labels"] = torch.tensor(label, dtype=torch.float32)
+        r_dict["dataset"] = dataset
+        
+        return r_dict
 
 
 def build_dataloader(
@@ -216,10 +224,12 @@ if __name__ == "__main__":
     )
     
     for batch in tqdm(train_loader):
-        print(batch)
+        # print(batch) 
+        pass
     
     if meta_loader:
         for batch in tqdm(meta_loader):
-            print(batch)
+            # print(batch)
+            pass
     else:
         print("No meta loader provided.")   
