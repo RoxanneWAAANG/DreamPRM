@@ -53,79 +53,6 @@ def read_json(source):
     return json_list
 
 
-def resize_image_if_needed(img, max_size=512):
-    """
-    Resize an image proportionally if either width or height exceeds max_size.
-    Maintains the original aspect ratio while scaling down the longest side to max_size.
-
-    :param img: PIL.Image object to be resized
-    :param max_size: Maximum allowed length for the longest side (default: 512)
-    :return: Resized PIL.Image object
-    """
-    width, height = img.size
-    # Check if the longest dimension exceeds max_size
-    if max(width, height) > max_size:
-        # Calculate scaling ratio while maintaining aspect ratio
-        scale_ratio = max_size / float(max(width, height))
-        new_width = int(width * scale_ratio)
-        new_height = int(height * scale_ratio)
-        # Resize image using LANCZOS resampling for high quality
-        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    return img
-
-class MyMetaDataset_QwenMath(Dataset):
-    """
-    Multi-step meta-learning examples. The `input` field contains all steps
-    joined by <extra_0>. We split and re-wrap each step individually.
-    Pre-processes all data during initialization for efficiency.
-    """
-    def __init__(self, records, tokenizer):
-        self.data_js = []
-        self.tokenizer = tokenizer
-        
-        pbar = tqdm(records, desc="Processing meta data")
-        for record in pbar:
-            input_text = record['input']
-            label = float(record['true_false'])
-            
-            # Get dataset identifier
-            dataset = record.get('id', str(len(self.data_js)))
-            
-            # Split into steps by separator
-            raw_steps = input_text.split("\n\n<extra_0>")
-            steps = [s.strip() for s in raw_steps if s.strip()]
-            
-            r_dict = {}
-            for step_idx, step in enumerate(steps, start=1):
-                messages = [
-                    {"role": "user", "content": step}
-                ]
-                text = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                inputs = self.tokenizer(
-                    text,  # String format, not list
-                    return_tensors="pt"
-                    # Remove .to("cuda") - let DataLoader handle device movement
-                )
-                r_dict[str(step_idx)] = {
-                    'input_ids': inputs['input_ids'].squeeze(),
-                    'attention_mask': inputs['attention_mask'].squeeze()
-                }
-            
-            r_dict['labels'] = torch.tensor(label, dtype=torch.float32)
-            r_dict['dataset'] = dataset
-            self.data_js.append(r_dict)
-
-    def __len__(self):
-        return len(self.data_js)
-
-    def __getitem__(self, idx):
-        return self.data_js[idx]
-
-
 class MyDataset_QwenMath(Dataset):
     """
     Single-step PRM training examples for QwenMath.
@@ -157,7 +84,7 @@ class MyDataset_QwenMath(Dataset):
             )
 
             inputs = self.tokenizer(
-                text,  # String format, not list
+                text,
                 return_tensors="pt"
                 # Remove add_special_tokens=False to match collaborator
                 # Remove .to("cuda") - let DataLoader handle device movement
@@ -169,6 +96,84 @@ class MyDataset_QwenMath(Dataset):
                 'label': torch.tensor(label, dtype=torch.float32),
                 'dataset': dataset
             })
+
+    def __len__(self):
+        return len(self.data_js)
+
+    def __getitem__(self, idx):
+        return self.data_js[idx]
+        
+
+class MyMetaDataset_QwenMath(Dataset):
+    """
+    Multi-step meta-learning examples. The `input` field contains all steps
+    joined by <extra_0>. We split and re-wrap each step individually.
+    Pre-processes all data during initialization for efficiency.
+    """
+    def __init__(self, records, tokenizer):
+        self.data_js = []
+        self.tokenizer = tokenizer
+        
+        pbar = tqdm(records, desc="Processing meta data")
+        for record in pbar:
+            input_text = record['input']
+            label = float(record['true_false'])
+            
+            # Get dataset identifier
+            dataset = record.get('id', str(len(self.data_js)))
+            
+            # Extract question (everything before the first "Step 1")
+            if "Step 1" in full_input:
+                question_part = full_input.split("Step 1")[0].strip()
+                # Remove trailing punctuation/newlines that might interfere
+                question = question_part.rstrip('\n:').strip()
+            else:
+                # Fallback: use entire input as question if no steps found
+                question = full_input.strip()
+
+            # Find total number of steps in the response
+            step_num = find_max_step(full_input)
+                        
+            r_dict = {}
+            for step_idx in range(1, step_num + 1):
+                # Extract this specific step from the full response
+                step_content = split_step(step_idx, full_input)
+                
+                # Create the proper format: question + step content
+                if step_idx == 1:
+                    # First step gets the full question
+                    step_input = question + "\n\n" + step_content
+                else:
+                    # Subsequent steps get question + previous steps + current step
+                    previous_steps = ""
+                    for prev_idx in range(1, step_idx):
+                        prev_step = split_step(prev_idx, full_input)
+                        previous_steps += prev_step + "\n\n"
+                    step_input = question + "\n\n" + previous_steps + step_content
+                
+                messages = [
+                    {"role": "user", "content": step_input.strip()}
+                ]
+                
+                text = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                
+                inputs = self.tokenizer(
+                    text,
+                    return_tensors="pt"
+                )
+                
+                r_dict[str(step_idx)] = {
+                    'input_ids': inputs['input_ids'].squeeze(),
+                    'attention_mask': inputs['attention_mask'].squeeze()
+                }
+            
+            r_dict['labels'] = torch.tensor(label, dtype=torch.float32)
+            r_dict['dataset'] = dataset
+            self.data_js.append(r_dict)
 
     def __len__(self):
         return len(self.data_js)
