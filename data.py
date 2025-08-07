@@ -60,48 +60,46 @@ class MyDataset_QwenMath(Dataset):
     Pre-processes all data during initialization for efficiency.
     """
     def __init__(self, records, tokenizer):
-        self.data_js = []
+        self.records = records
         self.tokenizer = tokenizer
-        
-        pbar = tqdm(records, desc="Processing train data")
-        for item in pbar:
-            prompt = item['input']
-            add = item['add']
-            label = float(item.get('accuracy', item.get('score', 0)))
-            # Use the actual dataset field (which contains problem id) for instance reweighting
-            dataset = item.get('dataset', str(item.get('id', len(self.data_js))))
-
-            messages = [
-                {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": add}
-            ]
-            
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False
-            )
-
-            inputs = self.tokenizer(
-                text,
-                return_tensors="pt"
-                # Remove add_special_tokens=False to match collaborator
-                # Remove .to("cuda") - let DataLoader handle device movement
-            )
-            
-            self.data_js.append({
-                'input_ids': inputs['input_ids'].squeeze(),
-                'attention_mask': inputs['attention_mask'].squeeze(),
-                'label': torch.tensor(label, dtype=torch.float32),
-                'dataset': dataset
-            })
+        print(f"Loaded {len(records)} samples")
 
     def __len__(self):
-        return len(self.data_js)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        return self.data_js[idx]
+        item = self.records[idx]
+        
+        prompt = item['input']
+        add = item['add']
+        label = float(item.get('accuracy', item.get('score', 0)))
+        dataset = item.get('dataset', str(item.get('id', idx)))
+
+        messages = [
+            {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": add}
+        ]
+        
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False
+        )
+
+        # Tokenize on-the-fly (no pre-processing)
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+        )
+
+        return {
+            'input_ids': inputs['input_ids'].squeeze(),
+            'attention_mask': inputs['attention_mask'].squeeze(),
+            'label': torch.tensor(label, dtype=torch.float32),
+            'dataset': dataset
+        }
         
 
 class MyMetaDataset_QwenMath(Dataset):
@@ -111,110 +109,62 @@ class MyMetaDataset_QwenMath(Dataset):
     Pre-processes all data during initialization for efficiency.
     """
     def __init__(self, records, tokenizer):
-        self.data_js = []
+        self.records = records
         self.tokenizer = tokenizer
-        
-        pbar = tqdm(records, desc="Processing meta data")
-        for record in pbar:
-            input_text = record['input']
-            label = float(record['true_false'])
-            
-            # Get dataset identifier
-            dataset = record.get('id', str(len(self.data_js)))
-            
-            # Extract question (everything before the first "Step 1")
-            if "Step 1" in full_input:
-                question_part = full_input.split("Step 1")[0].strip()
-                # Remove trailing punctuation/newlines that might interfere
-                question = question_part.rstrip('\n:').strip()
-            else:
-                # Fallback: use entire input as question if no steps found
-                question = full_input.strip()
-
-            # Find total number of steps in the response
-            step_num = find_max_step(full_input)
-                        
-            r_dict = {}
-            for step_idx in range(1, step_num + 1):
-                # Extract this specific step from the full response
-                step_content = split_step(step_idx, full_input)
-                
-                # Create the proper format: question + step content
-                if step_idx == 1:
-                    # First step gets the full question
-                    step_input = question + "\n\n" + step_content
-                else:
-                    # Subsequent steps get question + previous steps + current step
-                    previous_steps = ""
-                    for prev_idx in range(1, step_idx):
-                        prev_step = split_step(prev_idx, full_input)
-                        previous_steps += prev_step + "\n\n"
-                    step_input = question + "\n\n" + previous_steps + step_content
-                
-                messages = [
-                    {"role": "user", "content": step_input.strip()}
-                ]
-                
-                text = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                
-                inputs = self.tokenizer(
-                    text,
-                    return_tensors="pt"
-                )
-                
-                r_dict[str(step_idx)] = {
-                    'input_ids': inputs['input_ids'].squeeze(),
-                    'attention_mask': inputs['attention_mask'].squeeze()
-                }
-            
-            r_dict['labels'] = torch.tensor(label, dtype=torch.float32)
-            r_dict['dataset'] = dataset
-            self.data_js.append(r_dict)
+        print(f"Loaded {len(records)} meta samples")
 
     def __len__(self):
-        return len(self.data_js)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        return self.data_js[idx]
+        record = self.records[idx]
+        input_text = record['input']
+        label = float(record['true_false'])
+        dataset = record.get('id', str(idx))
+        
+        # Extract question
+        if "Step 1" in input_text:
+            question = input_text.split("Step 1")[0].strip()
+            question = question.replace("Question: ", "").strip()
+        else:
+            question = input_text.strip()
+        
+        # Find max step
+        step_num = find_max_step(input_text)
+        
+        # For simplicity, just return one random step (you can modify this)
+        import random
+        step_idx = random.randint(1, max(1, step_num))
+        
+        # Get cumulative content up to this step
+        step_content = question + "\n\n"
+        for i in range(1, step_idx + 1):
+            step = split_step(i, input_text)
+            step_content += step + "\n\n"
+        step_content = step_content.strip()
+        
+        messages = [
+            {"role": "user", "content": step_content}
+        ]
+        
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+        )
 
-
-def custom_collate_fn(batch):
-    """
-    Collate for train: pad sequences, stack labels and datasets list.
-    """
-    input_ids = pad_sequence([b['input_ids'] for b in batch], batch_first=True, padding_value=0)
-    attention_mask = pad_sequence([b['attention_mask'] for b in batch], batch_first=True, padding_value=0)
-    labels = torch.stack([b['label'] for b in batch])
-    datasets = [b['dataset'] for b in batch]
-    return {
-        'input_ids': input_ids,
-        'attention_mask': attention_mask,
-        'label': labels,
-        'dataset': datasets
-    }
-
-
-def meta_collate_fn(batch):
-    """
-    Collate for meta: stack per-step input_ids/attention_masks, and labels.
-    """
-    labels = torch.stack([b['labels'] for b in batch])
-    datasets = [b['dataset'] for b in batch]
-    collated = {'labels': labels, 'dataset': datasets}
-
-    # find step keys (assume all samples have same number of steps)
-    step_keys = sorted([k for k in batch[0].keys() if k.isdigit()], key=lambda x: int(x))
-    for k in step_keys:
-        collated[k] = {
-            'input_ids':      torch.stack([b[k]['input_ids'] for b in batch]),
-            'attention_mask': torch.stack([b[k]['attention_mask'] for b in batch]),
-            'dataset':        [b['dataset'] for b in batch]
+        return {
+            'input_ids': inputs['input_ids'].squeeze(),
+            'attention_mask': inputs['attention_mask'].squeeze(),
+            'label': torch.tensor(label, dtype=torch.float32),
+            'dataset': dataset
         }
-    return collated
 
 
 def build_dataloader(
@@ -233,7 +183,6 @@ def build_dataloader(
         train_dataset,
         batch_size=train_batch_size,
         shuffle=True,
-        collate_fn=custom_collate_fn
     )
 
     # Load meta data if provided
@@ -244,7 +193,6 @@ def build_dataloader(
             meta_dataset,
             batch_size=meta_batch_size,
             shuffle=True,
-            collate_fn=meta_collate_fn
         )
     else:
         meta_loader = None
@@ -253,3 +201,25 @@ def build_dataloader(
     print(f"Meta samples: {len(meta_dataset) if meta_loader else 0}")
     return train_loader, meta_loader
 
+
+if __name__ == "__main__":
+    processor_path = "/workspace/weights/qwen2.5-math-1.5b"
+    train_json_file = "data/train_prm800k.json"
+    meta_json_file = "data/meta_aime.json"
+    
+    train_loader, meta_loader = build_dataloader(
+        processor_path,
+        train_json_file,
+        meta_json_file,
+        train_batch_size=1,
+        meta_batch_size=1
+    )
+    
+    for batch in tqdm(train_loader):
+        print(batch)
+    
+    if meta_loader:
+        for batch in tqdm(meta_loader):
+            print(batch)
+    else:
+        print("No meta loader provided.")   
