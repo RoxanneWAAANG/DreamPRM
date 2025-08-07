@@ -19,13 +19,12 @@ class QwenMath_RM(nn.Module):
         self.args = args
         self.device = device
 
-        # self.base_model = AutoModelForCausalLM.from_pretrained(
-        self.base_model = AutoModel.from_pretrained(
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+        # self.base_model = AutoModel.from_pretrained(
             args.reward_model, 
-            # device_map=device, 
+            device_map=device, 
             torch_dtype=torch.bfloat16,
-            # trust_remote_code=True,
-            # low_cpu_mem_usage=True,
+            trust_remote_code=True,
         )
 
         # ----- LoRA: Only wrap if peft_rank > 0 -----
@@ -47,12 +46,13 @@ class QwenMath_RM(nn.Module):
         
         # Add classification head - map from hidden_size to 2 classes
         self.LN = nn.Linear(
-            self.base_model.config.hidden_size, 
+            self.base_model.config.vocab_size, 
             1, 
-            dtype=torch.bfloat16,
+            dtype=self.base_model.dtype,
         )
 
         self.softmax = nn.Softmax(dim=-1)
+        
         # Move to device
         self.to(device)
 
@@ -68,14 +68,14 @@ class QwenMath_RM(nn.Module):
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            # output_hidden_states=True,
-            # use_cache=False
-        )
-        
-        # Apply classification head
-        logits = self.LN(outputs.last_hidden_state[:, -1, :])  # [B, 3]
+        )   # [batch_size, seq_len, hidden_size]
 
-        return logits.squeeze(-1).to(dtype=torch.float32)
+        # Apply classification head
+        logits = self.LN(outputs.logits[:, -1, :])  # [batch_size, 1]
+        # Apply softmax to get probabilities
+        logits = self.softmax(logits)  # [batch_size, 2]
+
+        return logits.squeeze(-1)   # [batch_size]
     
 
 class InstanceTable(nn.Module):
