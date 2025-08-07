@@ -1,6 +1,9 @@
 # All code is original unless otherwise noted.
 '''
-python3 main.py \
+pip uninstall torch safetensors transformers
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+python main.py \
   --train_json_file data/train_prm800k.json \
   --meta_json_file data/meta_aime.json \
   --weights_path outputs/qwen_math_prm_v0 \
@@ -10,7 +13,7 @@ python3 main.py \
   --iteration_num 1000 \
   --save_every_iterations 200 \
   --scheduler_step_size 2000 \
-  --unroll_steps 1 \
+  --unroll_steps 5 \
   --precision bf16 \
   --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
@@ -28,7 +31,7 @@ import torch.optim as optim
 from torch.optim import AdamW
 import wandb
 
-from peft import LoraConfig, get_peft_model, TaskType
+# from peft import LoraConfig, get_peft_model, TaskType
 from betty.engine import Engine
 from betty.problems import ImplicitProblem
 from betty.configs import Config, EngineConfig
@@ -36,6 +39,10 @@ from betty.configs import Config, EngineConfig
 from model import *
 from data import *
 from utils import *
+
+if torch.cuda.is_available():
+    torch.cuda.init()
+    torch.cuda.empty_cache()
 
 
 parser = argparse.ArgumentParser(description="DreamPRM")
@@ -77,8 +84,6 @@ parser.add_argument("--lora_dropout", type=float, default=0.05)
 args = parser.parse_args()
 set_seed(args.seed)
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 # === Data, Domains, Device ===
 instance_list = create_dataset_mapping(args.train_json_file)
 device = torch.device(args.device)
@@ -102,7 +107,7 @@ best_loss = float('inf')
 
 # wandb init
 wandb.init(
-    project="DreamPRM-v0",
+    project="DreamPRM-v1",
     name=f"meta-bs{args.batch_size}-lr{args.lr}",
     config=vars(args)
 )
@@ -115,37 +120,51 @@ step_count = 0
 # ---------------------------------
 class Upper(ImplicitProblem):
     def forward(self, instance_strings, x):
-        # torch.cuda.empty_cache()
         return self.module(instance_strings, x)
 
-    def parameters(self):
-        """
-        Yield only the trainable (i.e., LoRA) parameters.
-        """
-        # return self.module.parameters()
-        return (p for p in self.module.parameters() if p.requires_grad)
+    # def parameters(self):
+    #     """
+    #     Yield only the trainable (i.e., LoRA) parameters.
+    #     """
+    #     # return self.module.parameters()
+    #     return (p for p in self.module.parameters() if p.requires_grad)
 
     def training_step(self, batch):
+        # torch.cuda.empty_cache()
+
         # steps = [batch['1'], batch['2'], batch['3'], batch['4'], batch['5'],]
         numeric_keys = [k for k in batch.keys() if k.isdigit()]
         sorted_keys = sorted(numeric_keys, key=lambda x: int(x))
         steps = [batch[key] for key in sorted_keys]
         labels = batch['labels'].to(device)
 
-        mean_score = 0
+        print(f"Processing {len(steps)} steps for dataset: {batch['dataset'][0]}")
+        print(f"Batch keys: {batch.keys()}")
+
+        # mean_score = 0
+        total_score = torch.tensor(0.0, device=device, requires_grad=True)
         for i in steps:
             score = self.lower(
                 i['input_ids'].to(device),
                 i['attention_mask'].to(device),
             )
             # mean_score += torch.log(score / (1 - score))
-            mean_score += score
-            
-        outputs = torch.sigmoid(mean_score / len(steps))
+            # mean_score += score
+            total_score = total_score + score / len(steps)
+
+        # outputs = torch.sigmoid(mean_score / len(steps))
+        outputs = torch.sigmoid(total_score)
+        print(f"Outputs: {outputs}")
+
+        # compute loss
         loss = criterion_meta(outputs, labels)
         upper_loss.append(loss.item())
 
-        # torch.cuda.empty_cache()
+        # clean memory
+        del steps, labels, outputs, total_score
+        torch.cuda.empty_cache()
+
+        # logging
         if len(upper_loss) == len(meta_dataloader):
             mean_outer_loss = np.mean(upper_loss)
             wandb.log({"outer_loss": mean_outer_loss})
@@ -171,59 +190,48 @@ class Upper(ImplicitProblem):
 # Lower Problem: PRM Fine-tuning + LoRA
 # ---------------------------------
 class Lower(ImplicitProblem):
-    def __init__(self, name, config):
-        super().__init__(name, config)
-        self.epoch_losses = []
-        self.current_epoch = 0
-        self.steps_per_epoch = len(train_dataloader)  # total steps in one epoch
-
-    def forward(self, input_ids, attention_mask):   #, pixel_values, image_grid_thw):
-        # torch.cuda.empty_cache()
+    def forward(self, input_ids, attention_mask):
         return self.module(input_ids, attention_mask)  #, pixel_values, image_grid_thw)
 
-    def parameters(self):
-        return (p for p in self.module.parameters() if p.requires_grad)
+    # def parameters(self):
+    #     return (p for p in self.module.parameters() if p.requires_grad)
 
     def training_step(self, batch):
-        global step_count
-        step_count += 1
+        torch.cuda.empty_cache()
 
         # ---- 1) forward pass ----
-        ids   = batch['input_ids'].to(device)
-        mask  = batch['attention_mask'].to(device)
+        ids = batch['input_ids'].to(device)
+        mask = batch['attention_mask'].to(device)
         labels = batch['label'].float().to(device)
+        instance_strings = batch['dataset']
 
+        # ---- 2) single forward pass ----
         step_scores = self.forward(
             input_ids=ids, 
             attention_mask=mask
         )
-
         loss = criterion(step_scores, labels)
 
-        # ---- 2) meta-reweight via upper ----
+        # ---- 3) meta-reweight via upper ----
         # shape it for InstanceTable: [1,1,B] or similar
         # weighted_loss = self.upper.forward(batch['dataset'], lt).squeeze()
-        weighted_loss = self.upper( # [B,1] → squeeze→[B]
-            batch['dataset'],
+        weighted_loss = self.upper( # [B,1] → squeeze → [B]
+            instance_strings,
             loss    # [B,1]
         )
-        lower_loss.append(loss.item())
-        lower_weighted_loss.append(weighted_loss.item())
 
-        # 4) logging
-        if len(lower_loss) == 100:
-            mean_inner_loss = np.mean(lower_loss)
-            mean_inner_weighted_loss = np.mean(lower_weighted_loss)
-            wandb.log(
-                {
-                    "inner_loss": np.mean(lower_loss),
-                    "inner_weighted_loss": np.mean(lower_weighted_loss)
-                }
-            )
+        # ---- 4) logging ----
+        lower_loss.append(loss.mean().item())
+        lower_weighted_loss.append(weighted_loss.mean().item())
+        
+        if len(lower_loss) >= 100:
+            wandb.log({
+                "inner_loss": np.mean(lower_loss),
+                "inner_weighted_loss": np.mean(lower_weighted_loss)
+            })
             lower_loss.clear()
             lower_weighted_loss.clear()
-        # torch.cuda.empty_cache()
-
+        
         return weighted_loss
 
     def configure_train_data_loader(self):
@@ -234,28 +242,24 @@ class Lower(ImplicitProblem):
         return QwenMath_RM(device, args)
 
     def configure_optimizer(self):
-        optimizer = optim.AdamW(
+        return optim.AdamW(
             self.module.parameters(),
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
-        return optimizer
 
     def configure_scheduler(self):
-        scheduler = optim.lr_scheduler.StepLR(
+        return optim.lr_scheduler.StepLR(
             self.optimizer,
             step_size = args.scheduler_step_size,
             gamma=args.scheduler_gamma
         )
-        return scheduler
 
 
 upper_config = Config(
     type="darts", 
     precision=args.precision, 
-    # retain_graph=True, 
-    retain_graph=False,
-    gradient_clipping=1.0, 
+    retain_graph=True, 
     gradient_accumulation=args.gradient_accumulation,
 )
 lower_config = Config(
@@ -263,7 +267,6 @@ lower_config = Config(
     precision=args.precision, 
     unroll_steps=args.unroll_steps, 
     gradient_accumulation=args.gradient_accumulation,
-    gradient_clipping=1.0
 )
 
 engine_config = EngineConfig(
@@ -277,12 +280,12 @@ engine_config = EngineConfig(
 # Instantiate problems
 upper = Upper(name="upper", config=upper_config)
 lower = Lower(name="lower", config=lower_config)
-problems = [upper, lower]
 
 # Define bidirectional dependencies
+problems = [upper, lower]
 dependencies = {
     "l2u": {lower: [upper]},    # Lower depends on Upper (since Lower calls self.upper)
-    "u2l": {upper: [lower]} # Upper depends on Lower (bilevel structure)
+    "u2l": {upper: [lower]}     # Upper depends on Lower (bilevel structure)
 }
 
 # Run
@@ -293,9 +296,10 @@ engine = Engine(
     dependencies=dependencies
 )
 
+print("Starting training...")
 engine.run()
-print("Training completed, saving models...")
 
+print("Saving models...")
 # Save the lower problem's model and tokenizer
 save_path = f"{args.weights_path}/qwen_math_prm"
 os.makedirs(save_path, exist_ok=True)
