@@ -123,15 +123,17 @@ class MyMetaDataset_QwenMath(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx):
+        torch.cuda.empty_cache()
+        
         record = self.records[idx]
         input_text = record['input']
         label = float(record['true_false'])
         dataset = record.get('id', str(idx))
-        print(f"Processing dataset: {dataset}")
+        # print(f"Processing dataset: {dataset}")
         
         # Find max step
         step_num = find_max_step(input_text)
-        print(f"Max step number found: {step_num}")
+        # print(f"Max step number found: {step_num}")
 
         # Create a dictionary to hold the cumulative content
         r_dict = {}
@@ -156,7 +158,7 @@ class MyMetaDataset_QwenMath(Dataset):
 
             # Tokenize the text
             inputs = self.tokenizer(
-                [text],
+                text,
                 return_tensors="pt",
                 padding=True,
             )
@@ -232,4 +234,6 @@ if __name__ == "__main__":
             # print(batch)
             pass
     else:
-        print("No meta loader provided.")   
+        print("No meta loader provided.")  
+
+    print("Data loading test completed.") # logits: [batch_size, seq_len, vocab_size] 
