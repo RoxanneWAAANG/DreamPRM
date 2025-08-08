@@ -13,7 +13,7 @@ python main.py \
   --iteration_num 1000 \
   --save_every_iterations 200 \
   --scheduler_step_size 2000 \
-  --unroll_steps 5 \
+  --unroll_steps 3 \
   --precision bf16 \
   --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
@@ -21,11 +21,14 @@ python main.py \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
   --device cuda
 '''
+import torch
+import os
+
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64,expandable_segments:False,backend:native'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 import argparse
-import os
 import numpy as np
-import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import AdamW
@@ -138,12 +141,27 @@ class Upper(ImplicitProblem):
         steps = [batch[key] for key in sorted_keys]
         labels = batch['labels'].to(device)
 
-        print(f"Processing {len(steps)} steps for dataset: {batch['dataset'][0]}")
-        print(f"Batch keys: {batch.keys()}")
+        # print(f"Processing {len(steps)} steps for dataset: {batch['dataset'][0]}")
+        # print(f"Batch keys: {batch.keys()}")
+
+        max_steps = 5 
+        # limit steps to max_steps
+        if len(steps) == 0:
+            return {"loss": torch.tensor(0.01, device=device, requires_grad=True)}
+        if len(steps) > max_steps:
+            print(f"Limiting to {max_steps} steps from {len(steps)}")
+            if len(steps) <= 5:
+                selected_steps = steps
+            else:
+                # select key steps: first, last, and evenly spaced middle steps
+                indices = [0, len(steps)//4, 2*len(steps)//4, 3*len(steps)//4, len(steps)-1]
+                selected_steps = [steps[i] for i in indices]
+        else:
+            selected_steps = steps
 
         # mean_score = 0
         total_score = torch.tensor(0.0, device=device, requires_grad=True)
-        for i in steps:
+        for i in selected_steps:
             score = self.lower(
                 i['input_ids'].to(device),
                 i['attention_mask'].to(device),
