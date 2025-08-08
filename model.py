@@ -19,9 +19,12 @@ class QwenMath_RM(nn.Module):
         self.args = args
         self.device = device
 
+        torch.cuda.empty_cache()
+
         self.base_model = AutoModelForCausalLM.from_pretrained(
-        # self.base_model = AutoModel.from_pretrained(
             args.reward_model, 
+            # attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
             device_map=device, 
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
@@ -53,8 +56,8 @@ class QwenMath_RM(nn.Module):
 
         self.softmax = nn.Softmax(dim=-1)
         
-        # Move to device
-        self.to(device)
+        # # Move to device
+        # self.to(device)
 
     def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor):
         """
