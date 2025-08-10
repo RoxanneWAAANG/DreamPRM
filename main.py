@@ -8,23 +8,23 @@ python main.py \
   --meta_json_file data/meta_aime.json \
   --weights_path outputs/qwen_math_prm_v0 \
   --batch_size 1 \
-  --gradient_accumulation 8 \
+  --gradient_accumulation 4 \
   --lr 1e-5 \
-  --iteration_num 1000 \
-  --save_every_iterations 200 \
-  --scheduler_step_size 2000 \
+  --iteration_num 200 \
+  --save_every_iterations 50 \
+  --scheduler_step_size 1000 \
   --unroll_steps 3 \
   --precision bf16 \
   --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
-  --max_epoch 10 \
+  --max_epoch 5 \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
   --device cuda
 '''
 import torch
 import os
 
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64,expandable_segments:False,backend:native'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32,expandable_segments:False,backend:native'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 import argparse
@@ -110,7 +110,7 @@ best_loss = float('inf')
 
 # wandb init
 wandb.init(
-    project="DreamPRM-v1",
+    project="DreamPRM",
     name=f"meta-bs{args.batch_size}-lr{args.lr}",
     config=vars(args)
 )
@@ -167,12 +167,11 @@ class Upper(ImplicitProblem):
                 i['attention_mask'].to(device),
             )
             # mean_score += torch.log(score / (1 - score))
-            # mean_score += score
             total_score = total_score + score / len(steps)
 
         # outputs = torch.sigmoid(mean_score / len(steps))
         outputs = torch.sigmoid(total_score)
-        print(f"Outputs: {outputs}")
+        # print(f"Outputs: {outputs}")
 
         # compute loss
         loss = criterion_meta(outputs, labels)
@@ -183,9 +182,12 @@ class Upper(ImplicitProblem):
         torch.cuda.empty_cache()
 
         # logging
-        if len(upper_loss) == len(meta_dataloader):
-            mean_outer_loss = np.mean(upper_loss)
-            wandb.log({"outer_loss": mean_outer_loss})
+        wandb.log({
+            "upper_loss": np.mean(upper_loss)
+        })
+
+        # clear upper_loss every 100 steps
+        if len(upper_loss) >= 100:
             upper_loss.clear()
 
         return {"loss": loss}
@@ -223,6 +225,8 @@ class Lower(ImplicitProblem):
         labels = batch['label'].float().to(device)
         instance_strings = batch['dataset']
 
+        # print(f"Processing dataset: {instance_strings[0]} with {len(ids)} steps")
+
         # ---- 2) single forward pass ----
         step_scores = self.forward(
             input_ids=ids, 
@@ -241,15 +245,18 @@ class Lower(ImplicitProblem):
         # ---- 4) logging ----
         lower_loss.append(loss.mean().item())
         lower_weighted_loss.append(weighted_loss.mean().item())
-        
+
+        wandb.log({
+            "inner_loss": np.mean(lower_loss),
+            "inner_weighted_loss": np.mean(lower_weighted_loss)
+        })
+
         if len(lower_loss) >= 100:
-            wandb.log({
-                "inner_loss": np.mean(lower_loss),
-                "inner_weighted_loss": np.mean(lower_weighted_loss)
-            })
             lower_loss.clear()
             lower_weighted_loss.clear()
-        
+
+        del ids, mask, labels, step_scores, loss
+
         return weighted_loss
 
     def configure_train_data_loader(self):
@@ -315,18 +322,30 @@ engine = Engine(
 )
 
 print("Starting training...")
-engine.run()
+# engine.run()
+try:
+    engine.run()
+except Exception as e:
+    # Handle any exceptions during training
+    # save the models when an error occurs
+    print(f"Training interrupted: {e}")
+    save_path = f"{args.weights_path}/emergency_save"
+    os.makedirs(save_path, exist_ok=True)
+    torch.save(lower.state_dict(), f"{save_path}/lower_state.pt")
+    torch.save(upper.state_dict(), f"{save_path}/upper_state.pt")
+    print(f"Models saved to {save_path}")
+
 
 print("Saving models...")
 # Save the lower problem's model and tokenizer
 save_path = f"{args.weights_path}/qwen_math_prm"
 os.makedirs(save_path, exist_ok=True)
-lower_problem.module.base_model.save_pretrained(save_path)
-lower_problem.module.tokenizer.save_pretrained(save_path)
+lower.module.base_model.save_pretrained(save_path)
+lower.module.tokenizer.save_pretrained(save_path)
 
 # Save the upper problem's state dict
 torch.save(
-    upper_problem.state_dict(),
+    upper.state_dict(),
     f"{args.weights_path}/domain_weights.pt"
 )
 
