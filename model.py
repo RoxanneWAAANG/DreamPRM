@@ -54,7 +54,7 @@ class QwenMath_RM(nn.Module):
             dtype=self.base_model.dtype,
         )
 
-        self.softmax = nn.Softmax(dim=-1)
+        self.sigmoid = nn.Sigmoid()
         
         # # Move to device
         # self.to(device)
@@ -76,7 +76,7 @@ class QwenMath_RM(nn.Module):
         # Apply classification head
         logits = self.LN(outputs.logits[:, -1, :])  # [batch_size, 1]
         # Apply softmax to get probabilities
-        logits = self.softmax(logits)  # [batch_size, 2]
+        logits = self.sigmoid(logits)  # [batch_size, 1]
 
         return logits.squeeze(-1)   # [batch_size]
     
