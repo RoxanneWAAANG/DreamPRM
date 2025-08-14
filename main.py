@@ -17,15 +17,17 @@ python main.py \
   --precision bf16 \
   --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
-  --max_epoch 5 \
+  --max_epoch 3 \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
   --device cuda
 '''
 import torch
 import os
 
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32,expandable_segments:False,backend:native'
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32,expandable_segments:False,backend:native'
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 import argparse
 import numpy as np
@@ -101,7 +103,7 @@ train_dataloader, meta_dataloader = build_dataloader(
 )
 
 # Loss
-criterion = nn.MSELoss(reduction="none")
+criterion = nn.MSELoss()
 criterion_meta = nn.MSELoss()
 
 # Tracking
@@ -115,8 +117,6 @@ wandb.init(
     config=vars(args)
 )
 
-# === Globals ===
-step_count = 0
 
 # ---------------------------------
 # Upper Problem (Instance Reweighting)
@@ -149,7 +149,7 @@ class Upper(ImplicitProblem):
         if len(steps) == 0:
             return {"loss": torch.tensor(0.01, device=device, requires_grad=True)}
         if len(steps) > max_steps:
-            print(f"Limiting to {max_steps} steps from {len(steps)}")
+            # print(f"Limiting to {max_steps} steps from {len(steps)}")
             if len(steps) <= 5:
                 selected_steps = steps
             else:
@@ -159,18 +159,16 @@ class Upper(ImplicitProblem):
         else:
             selected_steps = steps
 
-        # mean_score = 0
-        total_score = torch.tensor(0.0, device=device, requires_grad=True)
+        mean_score = 0
         for i in selected_steps:
             score = self.lower(
                 i['input_ids'].to(device),
                 i['attention_mask'].to(device),
             )
-            # mean_score += torch.log(score / (1 - score))
-            total_score = total_score + score / len(steps)
+            mean_score += torch.log(score / (1 - score))
 
-        # outputs = torch.sigmoid(mean_score / len(steps))
-        outputs = torch.sigmoid(total_score)
+        # Aggregate function: sigmoid of mean logits
+        outputs = torch.sigmoid(mean_score / len(selected_steps))
         # print(f"Outputs: {outputs}")
 
         # compute loss
@@ -178,7 +176,7 @@ class Upper(ImplicitProblem):
         upper_loss.append(loss.item())
 
         # clean memory
-        del steps, labels, outputs, total_score
+        del steps, labels, outputs, mean_score, selected_steps
         torch.cuda.empty_cache()
 
         # logging
@@ -228,11 +226,11 @@ class Lower(ImplicitProblem):
         # print(f"Processing dataset: {instance_strings[0]} with {len(ids)} steps")
 
         # ---- 2) single forward pass ----
-        step_scores = self.forward(
+        outputs = self.forward(
             input_ids=ids, 
             attention_mask=mask
         )
-        loss = criterion(step_scores, labels)
+        loss = criterion(outputs, labels)
 
         # ---- 3) meta-reweight via upper ----
         # shape it for InstanceTable: [1,1,B] or similar
@@ -255,7 +253,7 @@ class Lower(ImplicitProblem):
             lower_loss.clear()
             lower_weighted_loss.clear()
 
-        del ids, mask, labels, step_scores, loss
+        del ids, mask, labels, outputs, loss
 
         return weighted_loss
 
@@ -285,7 +283,7 @@ upper_config = Config(
     type="darts", 
     precision=args.precision, 
     retain_graph=True, 
-    gradient_accumulation=args.gradient_accumulation,
+    # gradient_accumulation=args.gradient_accumulation,
 )
 lower_config = Config(
     type="darts", 
@@ -295,7 +293,7 @@ lower_config = Config(
 )
 
 engine_config = EngineConfig(
-    train_iters=args.iteration_num * args.max_epoch,
+    train_iters=args.iteration_num,
     valid_step=args.save_every_iterations,
     # strategy=args.strategy,
     roll_back=args.rollback,
@@ -340,8 +338,8 @@ print("Saving models...")
 # Save the lower problem's model and tokenizer
 save_path = f"{args.weights_path}/qwen_math_prm"
 os.makedirs(save_path, exist_ok=True)
-lower.module.base_model.save_pretrained(save_path)
-lower.module.tokenizer.save_pretrained(save_path)
+torch.save(lower.state_dict(), f"{save_path}/lower_state.pt")
+torch.save(upper.state_dict(), f"{save_path}/upper_state.pt")
 
 # Save the upper problem's state dict
 torch.save(
