@@ -30,22 +30,22 @@ class QwenMath_RM(nn.Module):
             trust_remote_code=True,
         )
 
-        # ----- LoRA: Only wrap if peft_rank > 0 -----
-        if args.peft_rank > 0:
-            lora_conf = LoraConfig(
-                r=args.peft_rank,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                bias='none',
-                task_type=TaskType.FEATURE_EXTRACTION,
-                target_modules=["q_proj", "v_proj"]
-            )
-            self.base_model = get_peft_model(self.base_model, lora_conf)
-            # self.base_model.train()  # Ensure training mode
-            # for name, param in self.base_model.named_parameters():
-            #     if "lora_" in name:
-            #         param.requires_grad = True
-        #-----------------------------------#
+        # # ----- LoRA: Only wrap if peft_rank > 0 -----
+        # if args.peft_rank > 0:
+        #     lora_conf = LoraConfig(
+        #         r=args.peft_rank,
+        #         lora_alpha=args.lora_alpha,
+        #         lora_dropout=args.lora_dropout,
+        #         bias='none',
+        #         task_type=TaskType.FEATURE_EXTRACTION,
+        #         target_modules=["q_proj", "v_proj"]
+        #     )
+        #     self.base_model = get_peft_model(self.base_model, lora_conf)
+        #     # self.base_model.train()  # Ensure training mode
+        #     # for name, param in self.base_model.named_parameters():
+        #     #     if "lora_" in name:
+        #     #         param.requires_grad = True
+        # #-----------------------------------#
         
         # Add classification head - map from hidden_size to 2 classes
         self.LN = nn.Linear(
@@ -75,7 +75,7 @@ class QwenMath_RM(nn.Module):
 
         # Apply classification head
         logits = self.LN(outputs.logits[:, -1, :])  # [batch_size, 1]
-        # Apply softmax to get probabilities
+        # Apply sigmoid to get probabilities
         logits = self.sigmoid(logits)  # [batch_size, 1]
 
         return logits.squeeze(-1)   # [batch_size]
@@ -121,69 +121,18 @@ class InstanceTable(nn.Module):
         # Normalize weights by their mean to maintain scale
         normalized_weights = positive_weights / positive_weights.mean() + 1e-8
 
+        # Convert instance strings to indices matching batch order
         idxes = [self.instance_to_idx[d] for d in instance_strings]
+        # Create tensor of indices for batch lookup
         idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
 
+        # Retrieve instance weights for each sample in the batch [batch_size].
         instance_weights = normalized_weights[idxes]
 
+        # Reshape weights to match input tensor dimensions [batch_size, 1].
         instance_weights = instance_weights.view(-1, 1)
 
+        # Element-wise multiplication: each input value multiplied by its instance weight.
         out = x * instance_weights
         return out
 
-
-class DomainTable(nn.Module):
-    def __init__(self, domain_to_idx):
-        """
-        Args:
-            domain_to_idx (dict):
-                Mapping from domain strings to integer indices, e.g., {"domain_a": 0, "domain_b": 1}.
-        """
-        super(DomainTable, self).__init__()
-        self.domain_to_idx = domain_to_idx  # Maps domain names (like "AI2D", "M3CoT") to indices.
-        self.num_domains = len(domain_to_idx)   # Number of unique domains.
-
-        # Creates learnable parameters for domain weights,
-        # (initialized to zero, will be optimized during bi-level optimization).
-        self.raw_weights = nn.Parameter(torch.zeros(self.num_domains))
-
-    def forward(self, domain_strings, x):
-        """
-        Args:
-            domain_strings (list[str] or tuple[str]):
-                Domain names for each sample in the batch. Length should match x's batch_size.
-            x (torch.Tensor):
-                Input tensor of shape (batch_size, 1), containing a single value per sample.
-
-        Returns:
-            torch.Tensor:
-                Output tensor of same shape (batch_size, 1), where each element is the original input
-                multiplied by its corresponding domain weight.
-        """
-        # Apply softplus activation to ensure weights are positive.
-        # Softplus(x) = log(1 + exp(x)) ensures output > 0.
-        positive_weights = torch.nn.functional.softplus(self.raw_weights)
-
-        # Normalize weights by their mean to maintain scale.
-        # Ensures the average weight remains around 1.0.
-        # This stabilizes training and makes weights interpretable.
-        mean_weights = positive_weights.mean()
-        normalized_weights = positive_weights / mean_weights
-
-        # Convert domain strings to indices matching batch order.
-        # Maps domain names to their corresponding indices.
-        idxes = [self.domain_to_idx[d] for d in domain_strings]
-        # Creates tensor of indices for batch lookup.
-        idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
-
-        # Retrieve domain weights for each sample in the batch [batch_size].
-        # Uses advanced indexing to get weight for each sample's domain.
-        domain_weights = normalized_weights[idxes]
-
-        # Reshape weights to match input tensor dimensions [batch_size, 1].
-        domain_weights = domain_weights.view(-1, 1)
-
-        # Element-wise multiplication: each input value multiplied by its domain weight.
-        # Implements the domain reweighting in the lower-level optimization.
-        out = x * domain_weights
-        return out
