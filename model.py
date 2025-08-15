@@ -114,6 +114,9 @@ class InstanceTable(nn.Module):
             torch.Tensor:
                 同形状 (batch_size, 1) 的张量，每个元素等于原输入乘以对应的 domain 权重。
         """
+        # print(max(self.module.raw_weights))
+        # print(min(self.module.raw_weights))
+
         # positive_weights = self.raw_weights
         # Apply softplus to ensure weights are positive
         positive_weights = torch.nn.functional.softplus(self.raw_weights)
