@@ -87,17 +87,15 @@ class MyDataset_QwenMath(Dataset):
             {"role": "assistant", "content": add}
         ]
         
-        text = self.tokenizer.apply_chat_template(
+        inputs = self.tokenizer.apply_chat_template(
             messages,
-            tokenize=False,
-            add_generation_prompt=False
-        )
-
-        # Tokenize on-the-fly (no pre-processing)
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
+            add_generation_prompt=False,  # False because we have the complete conversation
+            tokenize=True,                # Direct tokenization
+            return_dict=True,             # Returns dict with input_ids, attention_mask
+            return_tensors="pt",          # Use PyTorch tensors
+            truncation=True,              # Truncate to max length
+            max_length=512,               # Set max length here
+            padding="max_length"          # Pad to max length
         )
 
         return {
@@ -130,14 +128,12 @@ class MyMetaDataset_QwenMath(Dataset):
         label = float(record['true_false'])
         dataset = record.get('id', str(idx))
         # print(f"Processing dataset: {dataset}")
-        
-        # Find max step
-        step_num = find_max_step(input_text)
-        # print(f"Max step number found: {step_num}")
 
         # Create a dictionary to hold the cumulative content
         r_dict = {}
-        
+        # Find max step
+        step_num = find_max_step(input_text)
+        # print(f"Max step number found: {step_num}")
         for index in range(step_num):
             step = split_step(index+1, input_text)
             # print(f"Processing step {index+1}: {step.strip()}")
@@ -150,17 +146,15 @@ class MyMetaDataset_QwenMath(Dataset):
             ]
 
             # Apply chat template
-            text = self.tokenizer.apply_chat_template(
+            inputs = self.tokenizer.apply_chat_template(
                 messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-
-            # Tokenize the text
-            inputs = self.tokenizer(
-                text,
+                add_generation_prompt=True,  # True because we want model to generate response
+                tokenize=True,
+                return_dict=True,
                 return_tensors="pt",
-                padding=True,
+                truncation=True,
+                max_length=512,
+                padding="max_length"
             )
 
             # Store the inputs in the dictionary
@@ -195,7 +189,7 @@ def build_dataloader(
         shuffle=True,
     )
 
-    # Load meta data if provided
+    # Load meta data
     if meta_json_file:
         meta_records = read_json(meta_json_file)
         meta_dataset = MyMetaDataset_QwenMath(meta_records, tokenizer)
@@ -215,7 +209,7 @@ def build_dataloader(
 if __name__ == "__main__":
     processor_path = "/workspace/weights/qwen2.5-math-1.5b"
     train_json_file = "data/train_prm800k.json"
-    meta_json_file = "data/meta_aime.json"
+    meta_json_file = "data/meta_aime2025.json"
     
     train_loader, meta_loader = build_dataloader(
         processor_path,
