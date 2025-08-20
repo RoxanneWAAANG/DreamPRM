@@ -5,19 +5,19 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 python main.py \
   --train_json_file data/train_prm800k.json \
-  --meta_json_file data/meta_aime.json \
-  --weights_path outputs/qwen_math_prm_v0 \
+  --meta_json_file data/meta_aime2025.json \
+  --weights_path outputs/qwen_math_prm_sanity \
   --batch_size 1 \
   --gradient_accumulation 4 \
   --lr 1e-5 \
-  --iteration_num 200 \
-  --save_every_iterations 50 \
+  --iteration_num 100 \
+  --save_every_iterations 20 \
   --scheduler_step_size 1000 \
-  --unroll_steps 3 \
+  --unroll_steps 5 \
   --precision bf16 \
   --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
-  --max_epoch 3 \
+  --max_epoch 4 \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
   --device cuda
 '''
@@ -112,7 +112,7 @@ best_loss = float('inf')
 
 # wandb init
 wandb.init(
-    project="DreamPRM",
+    project="DreamPRM-sanity",
     name=f"meta-bs{args.batch_size}-lr{args.lr}",
     config=vars(args)
 )
@@ -146,8 +146,6 @@ class Upper(ImplicitProblem):
 
         max_steps = 5 
         # limit steps to max_steps
-        if len(steps) == 0:
-            return {"loss": torch.tensor(0.01, device=device, requires_grad=True)}
         if len(steps) > max_steps:
             # print(f"Limiting to {max_steps} steps from {len(steps)}")
             if len(steps) <= 5:
@@ -165,7 +163,14 @@ class Upper(ImplicitProblem):
                 i['input_ids'].to(device),
                 i['attention_mask'].to(device),
             )
-            mean_score += torch.log(score / (1 - score))
+            # print(f"Step {i['input_ids']}: Score: {score}")
+            # logits = torch.logit(score, eps=1e-6)  # logit transformation
+            # print(f"Logits: {logits}")
+            # mean_score += logits.squeeze()  # [B,1] → [B]
+            # mean_score += torch.log(score / (1 - score))
+            score = score.squeeze()  # [B,1] → [B]
+            mean_score += torch.log(score + 1e-6) - torch.log(1 - score + 1e-6)  # logit transformation
+            # 0.5 is the initial value for sigmoid, so we can use logit transformation
 
         # Aggregate function: sigmoid of mean logits
         outputs = torch.sigmoid(mean_score / len(selected_steps))
@@ -230,6 +235,7 @@ class Lower(ImplicitProblem):
             input_ids=ids, 
             attention_mask=mask
         )
+        # calculate loss
         loss = criterion(outputs, labels)
 
         # ---- 3) meta-reweight via upper ----
@@ -245,17 +251,13 @@ class Lower(ImplicitProblem):
         lower_weighted_loss.append(weighted_loss.mean().item())
 
         wandb.log({
-            "inner_loss": np.mean(lower_loss),
-            "inner_weighted_loss": np.mean(lower_weighted_loss)
+            "lower_loss": np.mean(lower_loss),
+            "lower_weighted_loss": np.mean(lower_weighted_loss)
         })
-
-        if len(lower_loss) >= 100:
-            lower_loss.clear()
-            lower_weighted_loss.clear()
 
         del ids, mask, labels, outputs, loss
 
-        return weighted_loss
+        return weighted_loss.mean()
 
     def configure_train_data_loader(self):
         return train_dataloader
@@ -320,18 +322,18 @@ engine = Engine(
 )
 
 print("Starting training...")
-# engine.run()
-try:
-    engine.run()
-except Exception as e:
-    # Handle any exceptions during training
-    # save the models when an error occurs
-    print(f"Training interrupted: {e}")
-    save_path = f"{args.weights_path}/emergency_save"
-    os.makedirs(save_path, exist_ok=True)
-    torch.save(lower.state_dict(), f"{save_path}/lower_state.pt")
-    torch.save(upper.state_dict(), f"{save_path}/upper_state.pt")
-    print(f"Models saved to {save_path}")
+engine.run()
+# try:
+#     engine.run()
+# except Exception as e:
+#     # Handle any exceptions during training
+#     # save the models when an error occurs
+#     print(f"Training interrupted: {e}")
+#     save_path = f"{args.weights_path}/emergency_save"
+#     os.makedirs(save_path, exist_ok=True)
+#     torch.save(lower.state_dict(), f"{save_path}/lower_state.pt")
+#     torch.save(upper.state_dict(), f"{save_path}/upper_state.pt")
+#     print(f"Models saved to {save_path}")
 
 
 print("Saving models...")
