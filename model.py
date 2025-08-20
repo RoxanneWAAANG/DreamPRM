@@ -82,25 +82,21 @@ class QwenMath_RM(nn.Module):
     
 
 class InstanceTable(nn.Module):
-    def __init__(self, instance_to_idx, eps=1e-8):
+    def __init__(self, instance_to_idx):
         """
         Args:
             instance_to_idx (dict):
                 字符串 -> 整数索引 的映射，例如 {"domain_a": 0, "domain_b": 1}。
         """
-        super().__init__()
+        super(InstanceTable, self).__init__()
         self.instance_to_idx = instance_to_idx
         self.num_instance = len(instance_to_idx)
 
-        # self.raw_weights = nn.Parameter(
-        #     torch.zeros(self.num_instance)
-        # )  # 初始为1
         self.raw_weights = nn.Parameter(
-            torch.ones(self.num_instance, dtype=torch.float32)
-        )
+            torch.zeros(self.num_instance)
+        )  # 初始为1
 
         # self.relu = torch.nn.ReLU()
-        # self.eps = eps  # Small value to avoid division by zero
 
     def forward(self, instance_strings, x):
         """
@@ -114,23 +110,15 @@ class InstanceTable(nn.Module):
             torch.Tensor:
                 同形状 (batch_size, 1) 的张量，每个元素等于原输入乘以对应的 domain 权重。
         """
-        # print(max(self.module.raw_weights))
-        # print(min(self.module.raw_weights))
-
-        # positive_weights = self.raw_weights
-        # Apply softplus to ensure weights are positive
-        positive_weights = torch.nn.functional.softplus(self.raw_weights)
-
-        # Normalize weights by their mean to maintain scale
-        normalized_weights = positive_weights / positive_weights.mean() + 1e-8
-
+        positive_weights = self.raw_weights
+        
         # Convert instance strings to indices matching batch order
         idxes = [self.instance_to_idx[d] for d in instance_strings]
         # Create tensor of indices for batch lookup
         idxes = torch.tensor(idxes, dtype=torch.long, device=x.device)  # [batch_size]
 
         # Retrieve instance weights for each sample in the batch [batch_size].
-        instance_weights = normalized_weights[idxes]
+        instance_weights = positive_weights[idxes]
 
         # Reshape weights to match input tensor dimensions [batch_size, 1].
         instance_weights = instance_weights.view(-1, 1)
