@@ -5,19 +5,20 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 python main.py \
   --train_json_file data/train_prm800k.json \
-  --meta_json_file data/meta_aime2025.json \
-  --weights_path outputs/qwen_math_prm_sanity \
+  --meta_json_file data/meta_aime.json \
+  --weights_path outputs/qwen_math_prm_1.5b \
   --batch_size 1 \
-  --gradient_accumulation 4 \
+  --gradient_accumulation 8 \
   --lr 1e-5 \
-  --iteration_num 100 \
-  --save_every_iterations 20 \
+  --meta_lr 0.01 \
+  --iteration_num 3000 \
+  --save_every_iterations 1000 \
   --scheduler_step_size 1000 \
-  --unroll_steps 5 \
+  --unroll_steps 3 \
   --precision bf16 \
-  --scheduler_gamma 0.9 \
+  --scheduler_gamma 0.95 \
   --weight_decay 1e-4 \
-  --max_epoch 4 \
+  --max_epoch 10 \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
   --device cuda
 '''
@@ -322,18 +323,19 @@ engine = Engine(
 )
 
 print("Starting training...")
-engine.run()
-# try:
-#     engine.run()
-# except Exception as e:
-#     # Handle any exceptions during training
-#     # save the models when an error occurs
-#     print(f"Training interrupted: {e}")
-#     save_path = f"{args.weights_path}/emergency_save"
-#     os.makedirs(save_path, exist_ok=True)
-#     torch.save(lower.state_dict(), f"{save_path}/lower_state.pt")
-#     torch.save(upper.state_dict(), f"{save_path}/upper_state.pt")
-#     print(f"Models saved to {save_path}")
+# engine.run()
+try:
+    engine.run()
+except Exception as e:
+    # Handle any exceptions during training
+    # save the models when an error occurs
+    print(f"Training interrupted: {e}")
+    save_path = f"{args.weights_path}/emergency_save"
+    os.makedirs(save_path, exist_ok=True)
+    torch.save(lower.state_dict(), f"{save_path}/lower_state.pt")
+    torch.save(upper.state_dict(), f"{save_path}/upper_state.pt")
+    print(f"Models saved to {save_path}")
+    exit(1)
 
 
 print("Saving models...")
