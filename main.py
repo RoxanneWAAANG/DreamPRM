@@ -8,13 +8,13 @@ python main.py \
   --meta_json_file data/meta_aime.json \
   --weights_path outputs/qwen_math_prm_v1 \
   --batch_size 1 \
-  --gradient_accumulation 8 \
+  --gradient_accumulation 4 \
   --lr 1e-5 \
   --meta_lr 0.0005 \
   --iteration_num 5000 \
   --save_every_iterations 500 \
   --scheduler_step_size 2000 \
-  --unroll_steps 1 \
+  --unroll_steps 3 \
   --precision bf16 \
   --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
@@ -150,12 +150,9 @@ class Upper(ImplicitProblem):
         # limit steps to max_steps
         if len(steps) > max_steps:
             # print(f"Limiting to {max_steps} steps from {len(steps)}")
-            if len(steps) <= 5:
-                selected_steps = steps
-            else:
-                # select key steps: first, last, and evenly spaced middle steps
-                indices = [0, len(steps)//4, 2*len(steps)//4, 3*len(steps)//4, len(steps)-1]
-                selected_steps = [steps[i] for i in indices]
+            # select key steps: first, last, and evenly spaced middle steps
+            indices = [0, len(steps)//4, 2*len(steps)//4, 3*len(steps)//4, len(steps)-1]
+            selected_steps = [steps[i] for i in indices]
         else:
             selected_steps = steps
 
@@ -169,9 +166,10 @@ class Upper(ImplicitProblem):
             # logits = torch.logit(score, eps=1e-6)  # logit transformation
             # print(f"Logits: {logits}")
             # mean_score += logits.squeeze()  # [B,1] → [B]
-            # mean_score += torch.log(score / (1 - score))
+
             score = score.squeeze()  # [B,1] → [B]
-            mean_score += torch.log(score + 1e-6) - torch.log(1 - score + 1e-6)  # logit transformation
+            # mean_score += torch.log(score + 1e-6) - torch.log(1 - score + 1e-6)  # logit transformation
+            mean_score += torch.log(score / (1 - score))
             # 0.5 is the initial value for sigmoid, so we can use logit transformation
 
         # Aggregate function: sigmoid of mean logits
@@ -289,7 +287,7 @@ upper_config = Config(
     type="darts", 
     precision=args.precision, 
     retain_graph=True, 
-    # gradient_accumulation=args.gradient_accumulation,
+    gradient_accumulation=args.gradient_accumulation,
 )
 lower_config = Config(
     type="darts", 
