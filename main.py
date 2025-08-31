@@ -6,17 +6,17 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 python main.py \
   --train_json_file data/train_prm800k.json \
   --meta_json_file data/meta_aime.json \
-  --weights_path outputs/qwen_math_prm_1.5b \
+  --weights_path outputs/qwen_math_prm_v1 \
   --batch_size 1 \
   --gradient_accumulation 8 \
   --lr 1e-5 \
-  --meta_lr 0.01 \
-  --iteration_num 3000 \
-  --save_every_iterations 1000 \
-  --scheduler_step_size 1000 \
-  --unroll_steps 3 \
+  --meta_lr 0.0005 \
+  --iteration_num 5000 \
+  --save_every_iterations 500 \
+  --scheduler_step_size 2000 \
+  --unroll_steps 1 \
   --precision bf16 \
-  --scheduler_gamma 0.95 \
+  --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
   --max_epoch 10 \
   --reward_model Qwen/Qwen2.5-Math-1.5B \
@@ -113,7 +113,7 @@ best_loss = float('inf')
 
 # wandb init
 wandb.init(
-    project="DreamPRM-sanity",
+    project="DreamPRM-v1",
     name=f"meta-bs{args.batch_size}-lr{args.lr}",
     config=vars(args)
 )
@@ -141,6 +141,7 @@ class Upper(ImplicitProblem):
         sorted_keys = sorted(numeric_keys, key=lambda x: int(x))
         steps = [batch[key] for key in sorted_keys]
         labels = batch['labels'].to(device)
+        labels = labels.squeeze()
 
         # print(f"Processing {len(steps)} steps for dataset: {batch['dataset'][0]}")
         # print(f"Batch keys: {batch.keys()}")
@@ -178,6 +179,8 @@ class Upper(ImplicitProblem):
         # print(f"Outputs: {outputs}")
 
         # compute loss
+        # print("labels shape: ", labels.shape)
+        # print("outputs shape: ", outputs.shape)
         loss = criterion_meta(outputs, labels)
         upper_loss.append(loss.item())
 
