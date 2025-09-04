@@ -6,11 +6,11 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 python main.py \
   --train_json_file data/train_prm800k.json \
   --meta_json_file data/meta_aime.json \
-  --weights_path outputs/qwen_math_prm_v1 \
+  --weights_path outputs/qwen_math_prm_v2 \
   --batch_size 1 \
-  --gradient_accumulation 4 \
+  --gradient_accumulation 8 \
   --lr 1e-5 \
-  --meta_lr 0.0005 \
+  --meta_lr 0.001 \
   --iteration_num 5000 \
   --save_every_iterations 500 \
   --scheduler_step_size 2000 \
@@ -113,7 +113,7 @@ best_loss = float('inf')
 
 # wandb init
 wandb.init(
-    project="DreamPRM-v1",
+    project="DreamPRM-v2",
     name=f"meta-bs{args.batch_size}-lr{args.lr}",
     config=vars(args)
 )
@@ -168,8 +168,8 @@ class Upper(ImplicitProblem):
             # mean_score += logits.squeeze()  # [B,1] → [B]
 
             score = score.squeeze()  # [B,1] → [B]
-            # mean_score += torch.log(score + 1e-6) - torch.log(1 - score + 1e-6)  # logit transformation
-            mean_score += torch.log(score / (1 - score))
+            mean_score += torch.log(score + 1e-6) - torch.log(1 - score + 1e-6)  # logit transformation
+            # mean_score += torch.log(score / (1 - score))
             # 0.5 is the initial value for sigmoid, so we can use logit transformation
 
         # Aggregate function: sigmoid of mean logits
