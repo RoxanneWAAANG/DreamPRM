@@ -170,13 +170,15 @@ class MyMetaDataset_QwenMath(Dataset):
         
         return r_dict
 
+import random
 
 def build_dataloader(
     processor_path,
     train_json_file,
     meta_json_file,
     train_batch_size,
-    meta_batch_size
+    meta_batch_size,
+    max_meta_samples=None
 ):
     tokenizer = AutoTokenizer.from_pretrained(processor_path, trust_remote_code=True)
     
@@ -192,6 +194,13 @@ def build_dataloader(
     # Load meta data
     if meta_json_file:
         meta_records = read_json(meta_json_file)
+
+        if max_meta_samples is not None and len(meta_records) > max_meta_samples:
+            random.seed(42)
+            # meta_records = meta_records[:max_meta_samples]  # Take first N samples
+            meta_records = random.sample(meta_records, max_meta_samples)
+            print(f"Limited meta samples from {len(read_json(meta_json_file))} to {max_meta_samples}")
+
         meta_dataset = MyMetaDataset_QwenMath(meta_records, tokenizer)
         meta_loader = DataLoader(
             meta_dataset,
