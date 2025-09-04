@@ -82,7 +82,7 @@ class QwenMath_RM(nn.Module):
     
 
 class InstanceTable(nn.Module):
-    def __init__(self, instance_to_idx):
+    def __init__(self, instance_to_idx, activation_function="Clip", initialization=1.0):
         """
         Args:
             instance_to_idx (dict):
@@ -93,10 +93,17 @@ class InstanceTable(nn.Module):
         self.num_instance = len(instance_to_idx)
 
         self.raw_weights = nn.Parameter(
-            torch.zeros(self.num_instance)
-        )  # 初始为1
+            torch.ones(self.num_instance) * initialization
+        )
 
-        # self.relu = torch.nn.ReLU()
+        if activation_function == 'ReLU':
+            self.relu = torch.nn.ReLU()
+        elif activation_function == 'LeakyReLU':
+            self.relu = torch.nn.LeakyReLU()
+        elif activation_function == 'No':
+            self.relu = torch.nn.Identity()
+        elif activation_function == 'Clip':
+            self.relu = lambda t: torch.clamp(t, min=-1.0, max=3.0)
 
     def forward(self, instance_strings, x):
         """
@@ -110,7 +117,8 @@ class InstanceTable(nn.Module):
             torch.Tensor:
                 同形状 (batch_size, 1) 的张量，每个元素等于原输入乘以对应的 domain 权重。
         """
-        positive_weights = self.raw_weights
+        # positive_weights = self.raw_weights
+        positive_weights = self.relu(self.raw_weights)
         
         # Convert instance strings to indices matching batch order
         idxes = [self.instance_to_idx[d] for d in instance_strings]
