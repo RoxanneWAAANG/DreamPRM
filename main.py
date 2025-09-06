@@ -10,11 +10,11 @@ python main.py \
   --batch_size 1 \
   --gradient_accumulation 8 \
   --lr 1e-5 \
-  --meta_lr 0.001 \
-  --iteration_num 5000 \
-  --save_every_iterations 500 \
-  --scheduler_step_size 2000 \
-  --unroll_steps 3 \
+  --meta_lr 0.0005 \
+  --iteration_num 1000 \
+  --save_every_iterations 200 \
+  --scheduler_step_size 1000 \
+  --unroll_steps 5 \
   --precision bf16 \
   --scheduler_gamma 0.9 \
   --weight_decay 1e-4 \
@@ -36,6 +36,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim import AdamW
 import wandb
+
+from transformers import get_cosine_schedule_with_warmup
 
 # from peft import LoraConfig, get_peft_model, TaskType
 from betty.engine import Engine
@@ -209,6 +211,13 @@ class Upper(ImplicitProblem):
             lr=args.meta_lr,
             weight_decay=args.meta_weight_decay
         )
+    
+    def configure_scheduler(self):
+        return get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=int(0.1 * args.iteration_num),  # 10% warmup for meta
+            num_training_steps=args.iteration_num
+        )
 
 
 # ---------------------------------
@@ -276,10 +285,15 @@ class Lower(ImplicitProblem):
         )
 
     def configure_scheduler(self):
-        return optim.lr_scheduler.StepLR(
+        # return optim.lr_scheduler.StepLR(
+        #     self.optimizer,
+        #     step_size = args.scheduler_step_size,
+        #     gamma=args.scheduler_gamma
+        # )
+        return get_cosine_schedule_with_warmup(
             self.optimizer,
-            step_size = args.scheduler_step_size,
-            gamma=args.scheduler_gamma
+            num_warmup_steps=int(0.05 * args.iteration_num),  # 5% warmup
+            num_training_steps=args.iteration_num
         )
 
 
