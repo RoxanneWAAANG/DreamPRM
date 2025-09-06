@@ -93,7 +93,7 @@ class InstanceTable(nn.Module):
         self.num_instance = len(instance_to_idx)
 
         self.raw_weights = nn.Parameter(
-            torch.ones(self.num_instance) * initialization
+            torch.ones(self.num_instance) * initialization + torch.randn(self.num_instance) * 0.1
         )
 
         if activation_function == 'ReLU':
@@ -103,7 +103,7 @@ class InstanceTable(nn.Module):
         elif activation_function == 'No':
             self.relu = torch.nn.Identity()
         elif activation_function == 'Clip':
-            self.relu = lambda t: torch.clamp(t, min=-1.0, max=3.0)
+            self.relu = lambda t: torch.clamp(t, min=0.5, max=2.0)
 
     def forward(self, instance_strings, x):
         """
